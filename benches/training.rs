@@ -1,7 +1,9 @@
 use std::hint::black_box;
 
 use bbpe::{Trainer, TrainerConfig};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput};
+use criterion::{
+    criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
+};
 
 fn build_sequences() -> Vec<Vec<u8>> {
     let mut data = Vec::with_capacity(1 << 20);

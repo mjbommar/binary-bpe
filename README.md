@@ -14,7 +14,7 @@ cargo add bbpe
 
 For library-only usage without CLI:
 ```toml
-bbpe = { version = "0.1", default-features = false }
+bbpe = { version = "0.2", default-features = false }
 ```
 
 ## Quick Start
