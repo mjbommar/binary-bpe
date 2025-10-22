@@ -10,7 +10,7 @@ repository = "https://github.com/mjbommar/binary-bpe"
 homepage = "https://github.com/mjbommar/binary-bpe"
 documentation = "https://docs.rs/bbpe"
 keywords = ["bpe", "binary", "malware", "tokenizer", "huggingface"]
-categories = ["encoding", "science::ai"]
+categories = ["encoding", "text-processing"]
 rust-version = "1.74"
 exclude = [
     "/target",
