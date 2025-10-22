@@ -203,9 +203,11 @@ mod tests {
         let mut token_bytes: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
         token_bytes.push(b"hi".to_vec());
         let merges: Vec<Pair> = vec![(b'h' as TokenId, b'i' as TokenId)];
-        let mut config = TrainerConfig::default();
-        config.special_tokens = vec!["<|pad|>".into()];
-        config.show_progress = false;
+        let config = TrainerConfig {
+            special_tokens: vec!["<|pad|>".into()],
+            show_progress: false,
+            ..TrainerConfig::default()
+        };
         BpeModel::new(token_bytes, merges, config)
     }
 

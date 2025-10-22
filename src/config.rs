@@ -279,8 +279,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_missing_base_length() {
-        let mut cfg = TrainerConfig::default();
-        cfg.allowed_token_lengths = vec![2, 3];
+        let cfg = TrainerConfig {
+            allowed_token_lengths: vec![2, 3],
+            ..TrainerConfig::default()
+        };
         let err = cfg.validate().expect_err("validation should fail");
         assert!(matches!(
             err,
