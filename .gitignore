@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+**/*.swp
+# Training outputs / artefacts
+/tokenizer*.json
+# Cargo package output
+/target/package/
+# Local scratch data sets
+/test_data/
