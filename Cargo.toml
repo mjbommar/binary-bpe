@@ -47,6 +47,7 @@ tokenizers = { version = "0.22.1", default-features = true, features = ["onig"] 
 walkdir = "2.5"
 log = "0.4"
 ahash = "0.8.11"
+rand = "0.8"
 
 clap = { version = "4.5", features = ["derive"], optional = true }
 indicatif = { version = "0.18", features = ["rayon"], optional = true }
