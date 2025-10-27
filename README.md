@@ -90,6 +90,68 @@ Example with 1GB corpus:
 bbpe train ./corpus --vocab-size 16384 --min-frequency 128 -o large.json
 ```
 
+### chunk-train *(experimental)*
+Train independent tokenizers on fixed-size chunks, capture their intermediate merges, and combine the per-chunk vocabularies using a selectable strategy. This workflow keeps peak memory predictable while letting you experiment with ensemble-style reducers.
+
+```bash
+bbpe chunk-train <INPUT_PATH>... [OPTIONS]
+
+Key options:
+  --chunk-size <BYTES>     Target chunk size (default: 32 MiB)
+  --vocab-size <SIZE>      Target vocabulary size per chunk
+  --min-frequency <FREQ>   Minimum pair frequency per chunk
+  --combine-mode <MODE>    Vocabulary combiner: first | frequency | support | entropy (default: first)
+  --output <PATH>          Combined tokenizer path (default: chunked-tokenizer.json)
+  --report <PATH>          JSON report capturing per-chunk merges (default: chunk_train_report.json)
+```
+
+Example:
+
+```bash
+bbpe chunk-train ./corpus \
+  --chunk-size $((8 * 1024 * 1024)) \
+  --vocab-size 4096 \
+  --combine-mode first \
+  --output chunked.json \
+  --report chunked_report.json
+```
+
+The generated report records every chunk's merge sequence and metadata so that additional combination techniques can be prototyped without retraining.
+
+#### Combination modes
+
+- `first` – reuse the vocabulary from the first chunk verbatim.
+- `frequency` – aggregate merges by their summed per-chunk frequency.
+- `support` – favour merges that appear consistently across chunks (recommended baseline).
+- `entropy` – frequency weighting with entropy-based chunk weights (useful for heterogeneous corpora).
+
+#### Performance snapshot
+
+The chunked pipeline is designed to be competitive with the full trainer while slashing peak RAM:
+
+| corpus & vocab | mode | chunk size | peak RSS | wall time | bytes/token |
+| --- | --- | --- | --- | --- | --- |
+| sample-001.txt (1.38 GiB), vocab 4 096 | full train | — | ~6.9 GiB | 16 m 24 s | 4.39 |
+| sample-001.txt (1.38 GiB), vocab 4 096 | support | 4 MiB | **~1.4 GiB** | 16 m 04 s | **3.71** |
+| sample-002.txt (21.7 MiB), vocab 16 384 | full train | — | 0.20 GiB | 45 s | 6.22 |
+| sample-002.txt (21.7 MiB), vocab 16 384 | support | 4 MiB | **0.09 GiB** | 43 s | **4.73** |
+
+Support-mode chunking consistently realises the full merge budget, keeps throughput on par with the monolithic trainer, and produces more composable subword tokens.
+
+#### Inspecting token differences
+
+The helper script `scripts/compare_tokenizations.py` makes it easy to compare vocabularies:
+
+```bash
+uv run --with tokenizers python scripts/compare_tokenizations.py \
+  --text ~/sample-001.txt \
+  --bytes 256 \
+  --model full:/tmp/sample001-full.json \
+  --model support-4m:/tmp/sample001-support-4m.json
+```
+
+The script prints the raw excerpt and the token sequence for each model so you can eyeball how the chunk combiners differ from the full trainer.
+
 ### encode
 Convert binary files to token sequences.
 
