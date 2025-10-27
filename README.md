@@ -100,9 +100,10 @@ Key options:
   --chunk-size <BYTES>     Target chunk size (default: 32 MiB)
   --vocab-size <SIZE>      Target vocabulary size per chunk
   --min-frequency <FREQ>   Minimum pair frequency per chunk
-  --combine-mode <MODE>    Vocabulary combiner: first | frequency | support | entropy (default: first)
+  --combine-mode <MODE>    Vocabulary combiner: first | frequency | support | entropy (default: support)
   --output <PATH>          Combined tokenizer path (default: chunked-tokenizer.json)
   --report <PATH>          JSON report capturing per-chunk merges (default: chunk_train_report.json)
+  --no-progress            Disable per-chunk progress reporting
 ```
 
 Example:
@@ -111,18 +112,18 @@ Example:
 bbpe chunk-train ./corpus \
   --chunk-size $((8 * 1024 * 1024)) \
   --vocab-size 4096 \
-  --combine-mode first \
+  --combine-mode entropy \
   --output chunked.json \
   --report chunked_report.json
 ```
 
-The generated report records every chunk's merge sequence and metadata so that additional combination techniques can be prototyped without retraining.
+The generated report records every chunk's merge sequence and metadata so that additional combination techniques can be prototyped without retraining. Chunk training now emits a lightweight progress bar as it works through the corpus; pass `--no-progress` if you prefer the previous quiet mode (logging still reports a per-chunk summary either way).
 
 #### Combination modes
 
 - `first` – reuse the vocabulary from the first chunk verbatim.
 - `frequency` – aggregate merges by their summed per-chunk frequency.
-- `support` – favour merges that appear consistently across chunks (recommended baseline).
+- `support` – favour merges that appear consistently across chunks (default, recommended baseline).
 - `entropy` – frequency weighting with entropy-based chunk weights (useful for heterogeneous corpora).
 
 #### Performance snapshot

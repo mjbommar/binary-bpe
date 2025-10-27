@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 - 2025-10-27
+- Added an `indicatif`-powered progress bar to `bbpe chunk-train` plus a `--no-progress` escape hatch for quiet runs.
+- Switched the default chunk combiner to the support-based strategy for stronger out-of-the-box results and documented the change in the README.
+
 ## 0.2.0 - 2025-10-22
 - Added crate-level documentation with stricter lint gates (`#![forbid(unsafe_code)]`, `missing_docs`).
 - Documented configuration/corpus modules and added unit tests across bytes/config/corpus/model.

@@ -177,8 +177,12 @@ struct ChunkTrainArgs {
     #[arg(long)]
     follow_symlinks: bool,
 
+    /// Disable per-chunk progress reporting
+    #[arg(long)]
+    no_progress: bool,
+
     /// Combination strategy used to assemble the final vocabulary
-    #[arg(long = "combine-mode", value_enum, default_value_t = ChunkCombineMode::First)]
+    #[arg(long = "combine-mode", value_enum, default_value_t = ChunkCombineMode::Support)]
     combine_mode: ChunkCombineMode,
 }
 
@@ -937,17 +941,45 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         follow_symlinks: args.follow_symlinks,
     };
 
-    let mut total_bytes = 0usize;
     let mut chunk_summaries: Vec<ChunkSummary> = Vec::new();
     let mut snapshots: Vec<ChunkTrainingSnapshot> = Vec::new();
 
     let chunks =
         load_binary_corpus(&args.inputs, &ingest_cfg).with_context(|| "failed to load corpus")?;
+    let total_chunks = chunks.len();
+    let total_bytes: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+    info!(
+        "loaded {} chunks totalling {:.2} MiB",
+        total_chunks,
+        bytes_to_mebibytes(total_bytes)
+    );
+
+    let progress = if args.no_progress || total_chunks == 0 {
+        None
+    } else {
+        let pb = ProgressBar::new(total_chunks as u64);
+        let style = ProgressStyle::with_template(
+            "{spinner:.cyan} chunk {pos}/{len} [{elapsed_precise}] {wide_msg}",
+        )
+        .unwrap()
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
+        pb.set_style(style);
+        pb.enable_steady_tick(Duration::from_millis(80));
+        Some(pb)
+    };
 
     for (index, chunk) in chunks.into_iter().enumerate() {
         let byte_len = chunk.len();
         let entropy_bits = compute_entropy_bits(&chunk);
-        total_bytes += byte_len;
+        if let Some(pb) = progress.as_ref() {
+            let msg = format!(
+                "training chunk {}/{} ({:.2} MiB)",
+                index + 1,
+                total_chunks,
+                bytes_to_mebibytes(byte_len)
+            );
+            pb.set_message(msg);
+        }
 
         let mut sequences = Vec::with_capacity(1);
         sequences.push(chunk);
@@ -978,13 +1010,14 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
                 merges_applied,
             });
         }
+        let merge_count = merge_records.len();
 
         chunk_summaries.push(ChunkSummary {
             index,
             byte_len,
             entropy_bits,
             vocab_size,
-            merge_count: merge_records.len(),
+            merge_count,
             merges: merge_records,
         });
 
@@ -993,6 +1026,35 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
             byte_len,
             model,
         });
+
+        if let Some(pb) = progress.as_ref() {
+            pb.inc(1);
+            pb.suspend(|| {
+                info!(
+                    "chunk {}/{} ({:.2} MiB) => vocab {} ({} merges, entropy {:.2} bits)",
+                    index + 1,
+                    total_chunks,
+                    bytes_to_mebibytes(byte_len),
+                    vocab_size,
+                    merge_count,
+                    entropy_bits
+                );
+            });
+        } else {
+            info!(
+                "chunk {}/{} ({:.2} MiB) => vocab {} ({} merges, entropy {:.2} bits)",
+                index + 1,
+                total_chunks,
+                bytes_to_mebibytes(byte_len),
+                vocab_size,
+                merge_count,
+                entropy_bits
+            );
+        }
+    }
+
+    if let Some(pb) = progress {
+        pb.finish_with_message(format!("trained {} chunks", total_chunks));
     }
 
     if snapshots.is_empty() {
