@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 fn temp_workspace() -> TempDir {
@@ -114,4 +115,68 @@ fn train_encode_decode_round_trip() {
         info_text.contains("Vocab size"),
         "info output contained expected summary"
     );
+}
+
+#[test]
+fn chunk_train_emits_combined_tokenizer_and_report() {
+    let workspace = temp_workspace();
+    let input_path = workspace.path().join("input.bin");
+    let output_path = workspace.path().join("combined.json");
+    let report_path = workspace.path().join("report.json");
+
+    let data: Vec<u8> = (0..=63).cycle().take(2048).collect();
+    fs::write(&input_path, &data).expect("write input");
+
+    let run_chunk = |mode: &str, out: &PathBuf, report: &PathBuf| {
+        let mut cmd = Command::cargo_bin("bbpe").expect("binary exists");
+        cmd.current_dir(workspace.path()).args([
+            "--quiet",
+            "chunk-train",
+            input_path.file_name().unwrap().to_str().unwrap(),
+            "--vocab-size",
+            "270",
+            "--min-frequency",
+            "2",
+            "--chunk-size",
+            "512",
+            "--combine-mode",
+            mode,
+            "--output",
+            out.file_name().unwrap().to_str().unwrap(),
+            "--report",
+            report.file_name().unwrap().to_str().unwrap(),
+        ]);
+        run_command(&mut cmd);
+        assert!(out.exists(), "combined tokenizer was created for {mode}");
+        assert!(report.exists(), "chunk report was created for {mode}");
+        let report_bytes = fs::read(report).expect("read report");
+        let report: Value =
+            serde_json::from_slice(&report_bytes).expect("chunk report parses as JSON");
+        assert!(
+            report["total_chunks"].as_u64().unwrap_or(0) >= 1,
+            "report recorded at least one chunk for {mode}"
+        );
+        assert_eq!(
+            report["combine_mode"].as_str(),
+            Some(mode),
+            "combine mode recorded correctly for {mode}"
+        );
+        assert!(
+            report["combine_stats"]["merges_realized"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+            "combiner realised merges for {mode}"
+        );
+    };
+
+    run_chunk("first", &output_path, &report_path);
+
+    let freq_output = workspace.path().join("combined-frequency.json");
+    let freq_report = workspace.path().join("report-frequency.json");
+    run_chunk("frequency", &freq_output, &freq_report);
+
+    let entropy_output = workspace.path().join("combined-entropy.json");
+    let entropy_report = workspace.path().join("report-entropy.json");
+    run_chunk("entropy", &entropy_output, &entropy_report);
 }

@@ -25,14 +25,6 @@ Train a tokenizer on binary files and use it:
 # Train tokenizer (270MB ISO takes ~3 minutes, achieves 1.46 MiB/s)
 bbpe train /tmp/alpine-standard-3.22.2-x86_64.iso --vocab-size 8192 -o tokenizer.json
 
-# Low-memory alternative (32 MiB streaming chunks, writes report + tokenizer)
-bbpe chunk-train /tmp/alpine-standard-3.22.2-x86_64.iso \
-  --output chunk_report.json \
-  --final-tokenizer chunked-tokenizer.json
-
-# Inspect aggregate report
-jq '.global_merges[0:5]' chunk_report.json
-
 # Encode binary to tokens
 bbpe encode -m tokenizer.json binary.file --json
 {"path":"binary.file","tokens":[6299,144,144,144,6299,6335,213,4238]}
@@ -98,67 +90,67 @@ Example with 1GB corpus:
 bbpe train ./corpus --vocab-size 16384 --min-frequency 128 -o large.json
 ```
 
-### chunk-train
-Stream large corpora in fixed-size chunks, aggregate merge statistics, and optionally synthesise a tokenizer from the aggregated merges.
+### chunk-train *(experimental)*
+Train independent tokenizers on fixed-size chunks, capture their intermediate merges, and combine the per-chunk vocabularies using a selectable strategy. This workflow keeps peak memory predictable while letting you experiment with ensemble-style reducers.
 
 ```bash
 bbpe chunk-train <INPUT_PATH>... [OPTIONS]
 
 Key options:
-  --chunk-size <BYTES>         Chunk size in bytes (default: 33554432 / 32 MiB)
-  --chunk-merges <COUNT>       Per-chunk merge budget (default: 512)
-  --global-merges <COUNT>      Maximum merges to keep after aggregation (default: 4096)
-  --min-frequency <COUNT>      Minimum pair frequency per chunk (default: 4)
-  --rank-mode <MODE>           Aggregation ranking: weight | support | balanced (default: weight)
-  --support-weight <FACTOR>    Extra support multiplier when rank-mode=balanced (default: 1)
-  --min-chunk-support <COUNT>  Drop merges seen in fewer than COUNT chunks
-  --ensemble-mode <MODE>       Combine chunks via baseline | boost | sampled (default: baseline)
-  --boost-rounds <COUNT>       Boosting passes when ensemble-mode=boost (default: 1)
-  --boost-sample-size <COUNT>  Chunks per boosting round (defaults to all chunks)
-  --boost-learning-rate <RATE> Learning rate for boost weight updates (default: 0.5)
-  --sample-rounds <COUNT>      Monte Carlo rounds when ensemble-mode=sampled (default: 8)
-  --sample-chunks <COUNT>      Chunks per sampling round (defaults to √N)
-  --ensemble-seed <SEED>       Deterministic seed for boost/sample sampling
-  --final-tokenizer <PATH>     Emit a synthesised tokenizer from the aggregated merges
-  --final-merges <COUNT>       Cap merges realised in the synthesised tokenizer
-  --validation-fraction <RATIO> Hold out this fraction (0.0–0.5) of every chunk for validation (default: 0.08)
-  --validation-seed <SEED>     RNG seed used when sampling validation slices
-  --verbose-chunks             Log per-chunk stats as they are processed
+  --chunk-size <BYTES>     Target chunk size (default: 32 MiB)
+  --vocab-size <SIZE>      Target vocabulary size per chunk
+  --min-frequency <FREQ>   Minimum pair frequency per chunk
+  --combine-mode <MODE>    Vocabulary combiner: first | frequency | support | entropy (default: first)
+  --output <PATH>          Combined tokenizer path (default: chunked-tokenizer.json)
+  --report <PATH>          JSON report capturing per-chunk merges (default: chunk_train_report.json)
 ```
 
-The command writes a human-readable progress summary to stdout, a JSON report (default `chunked_merges.json`) describing every chunk plus the aggregated ranking, and, when `--final-tokenizer` is supplied, a Hugging Face-compatible `tokenizer.json`.
-
-When `--final-tokenizer` is requested, `chunk-train` now reserves `--validation-fraction` of every chunk (default 8%) as a held-out byte pool (pass `--validation-fraction 0` to disable). The final tokenizer is built by greedily replaying aggregated merge candidates, selecting only those that actually reduce token counts on the validation bytes. This outcome-driven pass keeps the RAM footprint bounded by the chunk size while ensuring the synthesised tokenizer matches the canonical trainer whenever the chunk size exceeds the corpus.
-
-`--ensemble-mode` unlocks two higher-variance reducers designed for large, heterogeneous corpora:
-
-- `boost` runs several weighted rounds, re-sampling chunks that were under-represented in earlier passes. The report’s `boost_details` array captures per-round coverage and the weight ranges that emerged.
-- `sampled` averages merge statistics across repeated random subsets, similar in spirit to bagging/extra-trees. The `sample_details` section records coverage statistics for every Monte Carlo draw.
-
-Both variants keep the memory footprint within the chunk budget while trading determinism for better coverage of rare patterns.
-
-Example (32 MiB chunks, default ranking):
-
-```bash
-bbpe chunk-train /tmp/alpine-standard-3.22.2-x86_64.iso \
-  --output /tmp/chunk_report.json \
-  --final-tokenizer /tmp/chunked-tokenizer.json
-
-# Quick look at the aggregated merges
-jq '.global_merges[0:3]' /tmp/chunk_report.json
-```
-
-The JSON report captures the full aggregation context, including `rank_mode`, `min_chunk_support`, the number of candidates considered, and per-chunk previews so you can audit what survives the reducer.
-
-To favour merges that appear across many chunks, switch to balanced ranking and increase the support weight:
+Example:
 
 ```bash
 bbpe chunk-train ./corpus \
-  --rank-mode balanced \
-  --support-weight 4 \
-  --min-chunk-support 3 \
-  --final-tokenizer chunked-balanced.json
+  --chunk-size $((8 * 1024 * 1024)) \
+  --vocab-size 4096 \
+  --combine-mode first \
+  --output chunked.json \
+  --report chunked_report.json
 ```
+
+The generated report records every chunk's merge sequence and metadata so that additional combination techniques can be prototyped without retraining.
+
+#### Combination modes
+
+- `first` – reuse the vocabulary from the first chunk verbatim.
+- `frequency` – aggregate merges by their summed per-chunk frequency.
+- `support` – favour merges that appear consistently across chunks (recommended baseline).
+- `entropy` – frequency weighting with entropy-based chunk weights (useful for heterogeneous corpora).
+
+#### Performance snapshot
+
+The chunked pipeline is designed to be competitive with the full trainer while slashing peak RAM:
+
+| corpus & vocab | mode | chunk size | peak RSS | wall time | bytes/token |
+| --- | --- | --- | --- | --- | --- |
+| sample-001.txt (1.38 GiB), vocab 4 096 | full train | — | ~6.9 GiB | 16 m 24 s | 4.39 |
+| sample-001.txt (1.38 GiB), vocab 4 096 | support | 4 MiB | **~1.4 GiB** | 16 m 04 s | **3.71** |
+| sample-002.txt (21.7 MiB), vocab 16 384 | full train | — | 0.20 GiB | 45 s | 6.22 |
+| sample-002.txt (21.7 MiB), vocab 16 384 | support | 4 MiB | **0.09 GiB** | 43 s | **4.73** |
+
+Support-mode chunking consistently realises the full merge budget, keeps throughput on par with the monolithic trainer, and produces more composable subword tokens.
+
+#### Inspecting token differences
+
+The helper script `scripts/compare_tokenizations.py` makes it easy to compare vocabularies:
+
+```bash
+uv run --with tokenizers python scripts/compare_tokenizations.py \
+  --text ~/sample-001.txt \
+  --bytes 256 \
+  --model full:/tmp/sample001-full.json \
+  --model support-4m:/tmp/sample001-support-4m.json
+```
+
+The script prints the raw excerpt and the token sequence for each model so you can eyeball how the chunk combiners differ from the full trainer.
 
 ### encode
 Convert binary files to token sequences.
@@ -247,25 +239,10 @@ print(encoded.ids)  # [6299, 144, 144, ...]
 
 ## Performance
 
-| Run                                      | Chunk Size | Wall Time | Peak RSS | Canon merges matched | Top-100 match | Bottom-100 match | Avg token len | Tokens ≥8 B | Realised merges | Dups/Unresolved | Notes |
-|------------------------------------------|------------|-----------|----------|----------------------|---------------|------------------|---------------|-------------|------------------|-----------------|-------|
-| `bbpe train` (full corpus)               | —          | 2m 49s    | 1.76 GB  | 4 089 (100 %)        | 100 %         | 100 %            | 2.03          | 0.7 %      | 4 089            | —               | Canonical reference tokenizer |
-| `chunk-train` boost                      | 1 MiB      | 1m 21s    | 0.29 GB  | 1 078 (26.4 %)       | 58 %          | 0 %              | 3.26          | 9.3 %      | 4 033            | 60 / 3          | 270 chunks; weights up to ×6 after 5 rounds |
-| `chunk-train` sampled                    | 1 MiB      | 1m 22s    | 0.29 GB  | 1 067 (26.1 %)       | 63 %          | 0 %              | 3.87          | 14.0 %     | 3 979            | 115 / 2         | 16 rounds ×64-chunk draws, heavier long-tail tokens |
-| `chunk-train` boost                      | 2 MiB      | 1m 20s    | 0.30 GB  | 1 189 (29.1 %)       | 69 %          | 0 %              | 2.67          | 5.0 %      | 4 058            | 34 / 4          | 135 chunks; coverage still ~18 % per round |
-| `chunk-train` sampled                    | 2 MiB      | 1m 20s    | 0.30 GB  | 1 243 (30.4 %)       | 65 %          | 0 %              | 3.08          | 8.0 %      | 4 035            | 59 / 2          | 16 rounds ×48 chunks improves overlap slightly |
-| `chunk-train` boost                      | 4 MiB      | 1m 21s    | 0.31 GB  | 1 209 (29.6 %)       | 71 %          | 0 %              | 2.66          | 5.2 %      | 4 057            | 37 / 2          | 68 chunks; fewer duplicates |
-| `chunk-train` sampled                    | 4 MiB      | 1m 21s    | 0.31 GB  | 1 263 (30.9 %)       | 73 %          | 0 %              | 2.66          | 5.1 %      | 4 060            | 33 / 3          | Highest overlap among tested chunk sizes |
-| `chunk-train` boost                      | 16 MiB     | 1m 27s    | 0.37 GB  | 1 196 (29.2 %)       | 81 %          | 0 %              | 2.31          | 2.6 %      | 4 083            | 13 / 0          | 17 chunks; coverage maxes at 100 % for sampled chunks |
-| `chunk-train` sampled                    | 16 MiB     | 1m 26s    | 0.37 GB  | 1 210 (29.6 %)       | 81 %          | 1 %              | 2.30          | 2.5 %      | 4 085            | 11 / 0          | Tail still diverges; overlap stabilises ~30 % |
-
-Observations:
-
-- Even with more sophisticated reducers, only ~26–31 % of canonical merges survive; variance lives almost entirely in the long tail (bottom‑100 overlap ≈ 0 %).
-- Top‑100 agreement improves with larger chunks (58 % ➝ 81 %), suggesting the ensembles capture high-frequency structure but continue to miss canonical late-stage merges.
-- Boosting concentrates probability mass on under-served chunks (round coverage means ≈ 0.17) but adds modest runtime overhead and still leaves ≈ 10 % of candidates as duplicates or unresolved dependencies.
-- Sampling hits slightly higher global overlap at 2–4 MiB, but amplifies chunk-local long literals (avg token length and ≥8 B share rise, especially at 1 MiB) and produces more duplicate merges.
-- Peak RSS scales with chunk size rather than ensemble mode; the chunk budget remains the dominant lever, not the reducer choice.
+- Training: >1 MiB/s on release builds
+- Parallel processing with Rayon
+- Incremental pair counting for efficient merging
+- Tested on 270MB files with sub-4-minute training time
 
 ## Development
 
