@@ -101,6 +101,7 @@ Key options:
   --vocab-size <SIZE>      Target vocabulary size per chunk
   --min-frequency <FREQ>   Minimum pair frequency per chunk
   --combine-mode <MODE>    Vocabulary combiner: first | frequency | support | entropy (default: support)
+  --duplicates <MODE>      Duplicate chunk handling: count | unique (default: count)
   --output <PATH>          Combined tokenizer path (default: chunked-tokenizer.json)
   --report <PATH>          JSON report capturing per-chunk merges (default: chunk_train_report.json)
   --no-progress            Disable per-chunk progress reporting
@@ -118,6 +119,8 @@ bbpe chunk-train ./corpus \
 ```
 
 The generated report records every chunk's merge sequence and metadata so that additional combination techniques can be prototyped without retraining. Chunk training now emits a lightweight progress bar as it works through the corpus; pass `--no-progress` if you prefer the previous quiet mode (logging still reports a per-chunk summary either way).
+
+Identical chunk contents are hashed and cached so repeated binaries no longer trigger redundant retraining. Use `--duplicates count` (default) to keep counting each duplicate when combining vocabularies, or switch to `--duplicates unique` to collapse identical chunks down to a single representative.
 
 #### Combination modes
 

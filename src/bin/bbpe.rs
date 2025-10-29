@@ -184,6 +184,10 @@ struct ChunkTrainArgs {
     /// Combination strategy used to assemble the final vocabulary
     #[arg(long = "combine-mode", value_enum, default_value_t = ChunkCombineMode::Support)]
     combine_mode: ChunkCombineMode,
+
+    /// Handling mode for duplicate chunk contents
+    #[arg(long = "duplicates", value_enum, default_value_t = ChunkDuplicateMode::Count)]
+    duplicate_mode: ChunkDuplicateMode,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -216,6 +220,30 @@ impl fmt::Display for ChunkCombineMode {
             Self::Frequency => "frequency",
             Self::Support => "support",
             Self::Entropy => "entropy",
+        };
+        f.write_str(label)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ChunkDuplicateMode {
+    /// Count duplicate chunks as independent samples during combination.
+    Count,
+    /// Only include a single representative for duplicate chunks.
+    Unique,
+}
+
+impl ChunkDuplicateMode {
+    fn counts_duplicates(self) -> bool {
+        matches!(self, Self::Count)
+    }
+}
+
+impl fmt::Display for ChunkDuplicateMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Count => "count",
+            Self::Unique => "unique",
         };
         f.write_str(label)
     }
@@ -404,7 +432,13 @@ struct ChunkTrainingSnapshot {
     model: BpeModel,
 }
 
-#[derive(Serialize)]
+struct CachedChunk {
+    first_index: usize,
+    summary: ChunkSummary,
+    snapshot: ChunkTrainingSnapshot,
+}
+
+#[derive(Serialize, Clone)]
 struct ChunkMergeRecord {
     iteration: usize,
     left: String,
@@ -413,7 +447,7 @@ struct ChunkMergeRecord {
     merges_applied: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ChunkSummary {
     index: usize,
     byte_len: usize,
@@ -437,7 +471,11 @@ struct ChunkTrainReport {
     trainer_vocab_size: usize,
     trainer_min_frequency: usize,
     total_bytes: usize,
+    processed_chunks: usize,
     total_chunks: usize,
+    duplicate_mode: String,
+    duplicate_chunks_reused: usize,
+    duplicate_chunks_skipped: usize,
     combine_mode: String,
     combine_detail: String,
     combine_stats: CombineStats,
@@ -968,7 +1006,60 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         Some(pb)
     };
 
+    let mut cache: FxHashMap<blake3::Hash, CachedChunk> = FxHashMap::default();
+    let mut duplicate_chunks_reused = 0usize;
+    let mut duplicate_chunks_skipped = 0usize;
+
     for (index, chunk) in chunks.into_iter().enumerate() {
+        let chunk_hash = blake3::hash(&chunk);
+        if let Some(entry) = cache.get(&chunk_hash) {
+            let hash_hex = chunk_hash.to_hex().to_string();
+            let hash_preview = hash_hex.get(..12).unwrap_or(&hash_hex);
+
+            let mut summary = entry.summary.clone();
+            let next_index = chunk_summaries.len();
+            summary.index = next_index;
+            let mut snapshot = entry.snapshot.clone();
+            snapshot.index = next_index;
+
+            if args.duplicate_mode.counts_duplicates() {
+                chunk_summaries.push(summary);
+                snapshots.push(snapshot);
+                duplicate_chunks_reused = duplicate_chunks_reused.saturating_add(1);
+            } else {
+                duplicate_chunks_skipped = duplicate_chunks_skipped.saturating_add(1);
+            }
+
+            if let Some(pb) = progress.as_ref() {
+                pb.inc(1);
+                pb.suspend(|| {
+                    info!(
+                        "chunk {}/{} duplicate of chunk {} (hash {}...) => vocab {} ({} merges, entropy {:.2} bits)",
+                        index + 1,
+                        total_chunks,
+                        entry.first_index + 1,
+                        hash_preview,
+                        entry.summary.vocab_size,
+                        entry.summary.merge_count,
+                        entry.summary.entropy_bits
+                    );
+                });
+            } else {
+                info!(
+                    "chunk {}/{} duplicate of chunk {} (hash {}...) => vocab {} ({} merges, entropy {:.2} bits)",
+                    index + 1,
+                    total_chunks,
+                    entry.first_index + 1,
+                    hash_preview,
+                    entry.summary.vocab_size,
+                    entry.summary.merge_count,
+                    entry.summary.entropy_bits
+                );
+            }
+
+            continue;
+        }
+
         let byte_len = chunk.len();
         let entropy_bits = compute_entropy_bits(&chunk);
         if let Some(pb) = progress.as_ref() {
@@ -1012,20 +1103,33 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         }
         let merge_count = merge_records.len();
 
-        chunk_summaries.push(ChunkSummary {
-            index,
+        let next_index = chunk_summaries.len();
+
+        let summary = ChunkSummary {
+            index: next_index,
             byte_len,
             entropy_bits,
             vocab_size,
             merge_count,
             merges: merge_records,
-        });
+        };
 
-        snapshots.push(ChunkTrainingSnapshot {
-            index,
+        let snapshot = ChunkTrainingSnapshot {
+            index: next_index,
             byte_len,
             model,
-        });
+        };
+
+        cache.insert(
+            chunk_hash,
+            CachedChunk {
+                first_index: index,
+                summary: summary.clone(),
+                snapshot: snapshot.clone(),
+            },
+        );
+        chunk_summaries.push(summary);
+        snapshots.push(snapshot);
 
         if let Some(pb) = progress.as_ref() {
             pb.inc(1);
@@ -1054,7 +1158,21 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
     }
 
     if let Some(pb) = progress {
-        pb.finish_with_message(format!("trained {} chunks", total_chunks));
+        pb.finish_with_message(format!(
+            "processed {} chunks (trained {} unique)",
+            total_chunks,
+            snapshots.len()
+        ));
+    }
+
+    if duplicate_chunks_reused > 0 || duplicate_chunks_skipped > 0 {
+        info!(
+            "deduplicated {} chunk(s) using {} mode (reused {}, skipped {})",
+            duplicate_chunks_reused + duplicate_chunks_skipped,
+            args.duplicate_mode,
+            duplicate_chunks_reused,
+            duplicate_chunks_skipped
+        );
     }
 
     if snapshots.is_empty() {
@@ -1090,7 +1208,11 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         trainer_vocab_size: trainer_cfg.target_vocab_size,
         trainer_min_frequency: trainer_cfg.min_frequency,
         total_bytes,
+        processed_chunks: total_chunks,
         total_chunks: snapshots.len(),
+        duplicate_mode: args.duplicate_mode.to_string(),
+        duplicate_chunks_reused,
+        duplicate_chunks_skipped,
         combine_mode: args.combine_mode.to_string(),
         combine_detail: combination.detail,
         combine_stats: combination.stats.clone(),
@@ -1110,13 +1232,18 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         .with_context(|| format!("failed to write chunk report to {}", args.report.display()))?;
 
     println!(
-        "🧪 chunk-train combined {} chunks ({} bytes) using {} -> {}",
+        "🧪 chunk-train combined {} chunks ({} bytes across {} processed chunks) using {} -> {}",
         report.total_chunks,
         report.total_bytes,
+        report.processed_chunks,
         args.combine_mode,
         args.output.display()
     );
     println!("   combine detail: {}", report.combine_detail);
+    println!(
+        "   duplicate mode: {} (reused {}, skipped {})",
+        report.duplicate_mode, report.duplicate_chunks_reused, report.duplicate_chunks_skipped
+    );
     println!("   report written to {}", args.report.display());
 
     Ok(())

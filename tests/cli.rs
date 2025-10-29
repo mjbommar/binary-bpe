@@ -180,3 +180,113 @@ fn chunk_train_emits_combined_tokenizer_and_report() {
     let entropy_report = workspace.path().join("report-entropy.json");
     run_chunk("entropy", &entropy_output, &entropy_report);
 }
+
+#[test]
+fn chunk_train_deduplicates_when_requested() {
+    let workspace = temp_workspace();
+    let file_a = workspace.path().join("dup-a.bin");
+    let file_b = workspace.path().join("dup-b.bin");
+
+    let data = vec![42u8; 512];
+    fs::write(&file_a, &data).expect("write dup-a");
+    fs::write(&file_b, &data).expect("write dup-b");
+
+    let unique_output = workspace.path().join("unique.json");
+    let unique_report = workspace.path().join("unique-report.json");
+
+    let mut unique_cmd = Command::cargo_bin("bbpe").expect("binary exists");
+    unique_cmd.current_dir(workspace.path()).args([
+        "--quiet",
+        "chunk-train",
+        file_a.file_name().unwrap().to_str().unwrap(),
+        file_b.file_name().unwrap().to_str().unwrap(),
+        "--chunk-size",
+        "512",
+        "--duplicates",
+        "unique",
+        "--no-progress",
+        "--output",
+        unique_output.file_name().unwrap().to_str().unwrap(),
+        "--report",
+        unique_report.file_name().unwrap().to_str().unwrap(),
+    ]);
+    run_command(&mut unique_cmd);
+
+    let unique_report_bytes = fs::read(&unique_report).expect("read unique report");
+    let unique: Value =
+        serde_json::from_slice(&unique_report_bytes).expect("parse unique report json");
+    assert_eq!(
+        unique["processed_chunks"].as_u64(),
+        Some(2),
+        "unique mode recorded processed chunk count"
+    );
+    assert_eq!(
+        unique["total_chunks"].as_u64(),
+        Some(1),
+        "unique mode reduced combined chunk count"
+    );
+    assert_eq!(
+        unique["duplicate_chunks_skipped"].as_u64(),
+        Some(1),
+        "unique mode skipped duplicate chunk"
+    );
+    assert_eq!(
+        unique["duplicate_chunks_reused"].as_u64(),
+        Some(0),
+        "unique mode did not reuse duplicates"
+    );
+    assert_eq!(
+        unique["duplicate_mode"].as_str(),
+        Some("unique"),
+        "duplicate mode recorded correctly for unique run"
+    );
+
+    let count_output = workspace.path().join("count.json");
+    let count_report = workspace.path().join("count-report.json");
+
+    let mut count_cmd = Command::cargo_bin("bbpe").expect("binary exists");
+    count_cmd.current_dir(workspace.path()).args([
+        "--quiet",
+        "chunk-train",
+        file_a.file_name().unwrap().to_str().unwrap(),
+        file_b.file_name().unwrap().to_str().unwrap(),
+        "--chunk-size",
+        "512",
+        "--duplicates",
+        "count",
+        "--no-progress",
+        "--output",
+        count_output.file_name().unwrap().to_str().unwrap(),
+        "--report",
+        count_report.file_name().unwrap().to_str().unwrap(),
+    ]);
+    run_command(&mut count_cmd);
+
+    let count_bytes = fs::read(&count_report).expect("read count report");
+    let count: Value = serde_json::from_slice(&count_bytes).expect("parse count report json");
+    assert_eq!(
+        count["processed_chunks"].as_u64(),
+        Some(2),
+        "count mode recorded processed chunk count"
+    );
+    assert_eq!(
+        count["total_chunks"].as_u64(),
+        Some(2),
+        "count mode retained both chunks"
+    );
+    assert_eq!(
+        count["duplicate_chunks_reused"].as_u64(),
+        Some(1),
+        "count mode reused duplicate chunk"
+    );
+    assert_eq!(
+        count["duplicate_chunks_skipped"].as_u64(),
+        Some(0),
+        "count mode did not skip duplicates"
+    );
+    assert_eq!(
+        count["duplicate_mode"].as_str(),
+        Some("count"),
+        "duplicate mode recorded correctly for count run"
+    );
+}

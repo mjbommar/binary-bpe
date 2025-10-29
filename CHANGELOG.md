@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2 - 2025-10-29
+- Added content-based chunk caching to `bbpe chunk-train`, eliminating redundant retraining for duplicated binaries.
+- Exposed a `--duplicates` flag to control whether duplicate chunks are counted or collapsed during combination, with detailed metrics in the chunk report and CLI output.
+- Extended chunk-train reports and README documentation to capture the new deduplication workflow.
+
 ## 0.3.1 - 2025-10-27
 - Added an `indicatif`-powered progress bar to `bbpe chunk-train` plus a `--no-progress` escape hatch for quiet runs.
 - Switched the default chunk combiner to the support-based strategy for stronger out-of-the-box results and documented the change in the README.
