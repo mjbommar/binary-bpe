@@ -3,7 +3,9 @@
 use std::path::Path;
 
 use ahash::AHashMap;
+use tokenizers::decoders::{fuse::Fuse, DecoderWrapper};
 use tokenizers::models::bpe::BPE;
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::tokenizer::AddedToken;
 use tokenizers::Tokenizer;
 
@@ -102,6 +104,9 @@ impl BpeModel {
             .build()
             .map_err(|err| BbpeError::Tokenizers(err.to_string()))?;
         let mut tokenizer = Tokenizer::new(builder);
+
+        tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
+        tokenizer.with_decoder(Some(DecoderWrapper::Fuse(Fuse::new())));
 
         if !self.special_tokens.is_empty() {
             let added = self
