@@ -290,3 +290,170 @@ fn chunk_train_deduplicates_when_requested() {
         "duplicate mode recorded correctly for count run"
     );
 }
+
+#[test]
+fn train_with_max_entropy_filter() {
+    let workspace = temp_workspace();
+    let low_entropy = workspace.path().join("low.bin");
+    let high_entropy = workspace.path().join("high.bin");
+    let output_path = workspace.path().join("tokenizer.json");
+
+    // Low entropy: repeated bytes
+    let low_data = vec![0u8; 1024];
+    fs::write(&low_entropy, &low_data).expect("write low entropy file");
+
+    // High entropy: random-looking pattern
+    let high_data: Vec<u8> = (0..=255).cycle().take(1024).collect();
+    fs::write(&high_entropy, &high_data).expect("write high entropy file");
+
+    let mut train = Command::cargo_bin("bbpe").expect("binary exists");
+    train.current_dir(workspace.path()).args([
+        "--quiet",
+        "train",
+        low_entropy.file_name().unwrap().to_str().unwrap(),
+        high_entropy.file_name().unwrap().to_str().unwrap(),
+        "--vocab-size",
+        "270",
+        "--max-entropy",
+        "7.0",
+        "--no-progress",
+        "--chunk-size",
+        "512",
+        "-o",
+        output_path.file_name().unwrap().to_str().unwrap(),
+    ]);
+    run_command(&mut train);
+    assert!(
+        output_path.exists(),
+        "tokenizer was created with max-entropy filter"
+    );
+}
+
+#[test]
+fn train_with_min_entropy_filter() {
+    let workspace = temp_workspace();
+    let low_entropy = workspace.path().join("low.bin");
+    let normal_entropy = workspace.path().join("normal.bin");
+    let output_path = workspace.path().join("tokenizer.json");
+
+    // Very low entropy: all zeros
+    let low_data = vec![0u8; 1024];
+    fs::write(&low_entropy, &low_data).expect("write low entropy file");
+
+    // Normal entropy: mixed bytes
+    let normal_data: Vec<u8> = (0..=255).cycle().take(1024).collect();
+    fs::write(&normal_entropy, &normal_data).expect("write normal entropy file");
+
+    let mut train = Command::cargo_bin("bbpe").expect("binary exists");
+    train.current_dir(workspace.path()).args([
+        "--quiet",
+        "train",
+        low_entropy.file_name().unwrap().to_str().unwrap(),
+        normal_entropy.file_name().unwrap().to_str().unwrap(),
+        "--vocab-size",
+        "270",
+        "--min-entropy",
+        "0.5",
+        "--no-progress",
+        "--chunk-size",
+        "512",
+        "-o",
+        output_path.file_name().unwrap().to_str().unwrap(),
+    ]);
+    run_command(&mut train);
+    assert!(
+        output_path.exists(),
+        "tokenizer was created with min-entropy filter"
+    );
+}
+
+#[test]
+fn train_with_both_entropy_filters() {
+    let workspace = temp_workspace();
+    let input_path = workspace.path().join("input.bin");
+    let output_path = workspace.path().join("tokenizer.json");
+
+    // Medium entropy data - use fewer unique bytes (0..=31) to get entropy around 5 bits/byte
+    let data: Vec<u8> = (0..=31).cycle().take(2048).collect();
+    fs::write(&input_path, &data).expect("write input");
+
+    let mut train = Command::cargo_bin("bbpe").expect("binary exists");
+    train.current_dir(workspace.path()).args([
+        "--quiet",
+        "train",
+        input_path.file_name().unwrap().to_str().unwrap(),
+        "--vocab-size",
+        "270",
+        "--min-entropy",
+        "0.2",
+        "--max-entropy",
+        "7.0",
+        "--no-progress",
+        "--chunk-size",
+        "512",
+        "-o",
+        output_path.file_name().unwrap().to_str().unwrap(),
+    ]);
+    run_command(&mut train);
+    assert!(
+        output_path.exists(),
+        "tokenizer was created with both entropy filters"
+    );
+}
+
+#[test]
+fn train_entropy_filter_invalid_range() {
+    let workspace = temp_workspace();
+    let input_path = workspace.path().join("input.bin");
+    let output_path = workspace.path().join("tokenizer.json");
+
+    let data: Vec<u8> = (0..=255).cycle().take(1024).collect();
+    fs::write(&input_path, &data).expect("write input");
+
+    let mut train = Command::cargo_bin("bbpe").expect("binary exists");
+    train.current_dir(workspace.path()).args([
+        "--quiet",
+        "train",
+        input_path.file_name().unwrap().to_str().unwrap(),
+        "--vocab-size",
+        "270",
+        "--min-entropy",
+        "7.0",
+        "--max-entropy",
+        "0.5",
+        "--no-progress",
+        "-o",
+        output_path.file_name().unwrap().to_str().unwrap(),
+    ]);
+    train.assert().failure();
+}
+
+#[test]
+fn train_entropy_filter_rejects_all() {
+    let workspace = temp_workspace();
+    let input_path = workspace.path().join("input.bin");
+    let output_path = workspace.path().join("tokenizer.json");
+
+    // Normal entropy data
+    let data: Vec<u8> = (0..=255).cycle().take(1024).collect();
+    fs::write(&input_path, &data).expect("write input");
+
+    let mut train = Command::cargo_bin("bbpe").expect("binary exists");
+    train.current_dir(workspace.path()).args([
+        "--quiet",
+        "train",
+        input_path.file_name().unwrap().to_str().unwrap(),
+        "--vocab-size",
+        "270",
+        "--min-entropy",
+        "7.5",
+        "--max-entropy",
+        "7.6",
+        "--no-progress",
+        "--chunk-size",
+        "512",
+        "-o",
+        output_path.file_name().unwrap().to_str().unwrap(),
+    ]);
+    train.assert().failure();
+}

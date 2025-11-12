@@ -348,8 +348,8 @@ mod tests {
             chunk_size: 4,
             ..IngestConfig::default()
         };
-        let expected =
-            load_binary_corpus(&[file.clone()], &cfg).expect("load corpus with chunking enabled");
+        let expected = load_binary_corpus(std::slice::from_ref(&file), &cfg)
+            .expect("load corpus with chunking enabled");
         let stream =
             stream_binary_corpus(&[file], &cfg).expect("stream corpus with chunking enabled");
         assert_eq!(stream.total_chunks(), expected.len());

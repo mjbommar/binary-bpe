@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 - 2025-11-12
+- Added `--min-entropy` and `--max-entropy` flags to `bbpe train` command for filtering chunks during regular training.
+- Enhanced test coverage with 5 new integration tests for entropy filtering in train command.
+- Fixed clippy warning in corpus.rs test (cloned_ref_to_slice_refs).
+
 ## 0.4.0 - 2025-11-12
 - Added parallel chunk training using rayon for significant performance improvements on multi-core systems.
 - Introduced entropy-based filtering with `--min-entropy` and `--max-entropy` flags to skip low-information and compressed chunks.

@@ -129,6 +129,14 @@ struct TrainArgs {
     /// Follow symlinks during traversal
     #[arg(long)]
     follow_symlinks: bool,
+
+    /// Minimum entropy threshold in bits/byte for filtering chunks (e.g., 0.20)
+    #[arg(long, value_name = "BITS")]
+    min_entropy: Option<f64>,
+
+    /// Maximum entropy threshold in bits/byte for filtering chunks (e.g., 7.0)
+    #[arg(long, value_name = "BITS")]
+    max_entropy: Option<f64>,
 }
 
 #[derive(Args, Debug)]
@@ -908,7 +916,7 @@ fn run_train(args: TrainArgs) -> Result<()> {
         follow_symlinks: args.follow_symlinks,
     };
 
-    let sequences = load_binary_corpus(&args.inputs, &ingest_cfg)
+    let mut sequences = load_binary_corpus(&args.inputs, &ingest_cfg)
         .with_context(|| "failed to load binary corpus")?;
     let corpus_bytes: usize = sequences.iter().map(|seq| seq.len()).sum();
     info!(
@@ -916,6 +924,54 @@ fn run_train(args: TrainArgs) -> Result<()> {
         sequences.len(),
         bytes_to_mebibytes(corpus_bytes)
     );
+
+    // Apply entropy filtering if thresholds are specified
+    if args.min_entropy.is_some() || args.max_entropy.is_some() {
+        let min_entropy = args.min_entropy.unwrap_or(0.0).max(0.0);
+        let max_entropy = args.max_entropy.unwrap_or(8.0).min(8.0);
+
+        if min_entropy > max_entropy {
+            return Err(anyhow!(
+                "min-entropy threshold ({min_entropy}) cannot exceed max-entropy ({max_entropy})"
+            ));
+        }
+
+        let original_count = sequences.len();
+        let mut filtered_low = 0usize;
+        let mut filtered_high = 0usize;
+
+        sequences.retain(|seq| {
+            let entropy = compute_entropy_bits(seq);
+            let below_min = entropy < min_entropy;
+            let above_max = entropy > max_entropy;
+
+            if below_min {
+                filtered_low += 1;
+            }
+            if above_max {
+                filtered_high += 1;
+            }
+
+            !below_min && !above_max
+        });
+
+        let filtered_bytes: usize = sequences.iter().map(|seq| seq.len()).sum();
+
+        info!(
+            "entropy filtering: kept {} / {} sequences ({:.2} MiB), filtered {} low / {} high",
+            sequences.len(),
+            original_count,
+            bytes_to_mebibytes(filtered_bytes),
+            filtered_low,
+            filtered_high
+        );
+
+        if sequences.is_empty() {
+            return Err(anyhow!(
+                "all sequences were filtered out by entropy thresholds (min: {min_entropy}, max: {max_entropy})"
+            ));
+        }
+    }
 
     let spinner = if args.no_progress {
         None
