@@ -21,6 +21,9 @@ exclude = [
     "/test_data",
     "/.gitignore",
     "/.github",
+    "/experiments",
+    "/references",
+    "/scripts",
 ]
 
 [features]
