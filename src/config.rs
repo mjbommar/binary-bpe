@@ -87,7 +87,7 @@ impl Default for TrainerConfig {
         Self {
             target_vocab_size: 32_768,
             min_frequency: 4,
-            allowed_token_lengths: (1..=16).collect(),
+            allowed_token_lengths: (1..=32).collect(),
             show_progress: true,
             special_tokens: vec![
                 "<|start|>".into(),
