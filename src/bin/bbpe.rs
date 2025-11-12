@@ -1,27 +1,35 @@
+use std::collections::hash_map::Entry;
 use std::convert::TryFrom;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bbpe::bytes::{bytes_to_latin1, latin1_to_bytes};
 use bbpe::config::{IngestConfig, TrainerConfig};
-use bbpe::corpus::load_binary_corpus;
+use bbpe::corpus::{load_binary_corpus, stream_binary_corpus};
 use bbpe::model::{Pair, TokenId};
 use bbpe::serialization;
-use bbpe::{BinaryTokenizer, BpeModel, Trainer};
+use bbpe::{BinaryTokenizer, BpeModel, Trainer, TrainerArtifacts};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
+use rayon::iter::ParallelBridge;
+use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use rustc_hash::FxHashMap;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
 
 const DEFAULT_OUTPUT: &str = "tokenizer.json";
+const DEFAULT_MIN_ENTROPY: f64 = 0.20;
+const DEFAULT_MAX_ENTROPY: f64 = 7.80;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Binary BPE toolkit", long_about = None)]
@@ -137,6 +145,10 @@ struct ChunkTrainArgs {
     #[arg(long, value_name = "PATH", default_value = "chunk_train_report.json")]
     report: PathBuf,
 
+    /// Disable writing the chunk training report JSON
+    #[arg(long)]
+    no_report: bool,
+
     /// Target chunk size in bytes
     #[arg(
         long = "chunk-size",
@@ -164,6 +176,14 @@ struct ChunkTrainArgs {
     /// Maximum merge iterations
     #[arg(long, value_name = "COUNT")]
     max_merge_iterations: Option<usize>,
+
+    /// Minimum entropy threshold in bits/byte before training a chunk (default 0.10)
+    #[arg(long, value_name = "BITS")]
+    min_entropy: Option<f64>,
+
+    /// Maximum entropy threshold in bits/byte before training a chunk (default 7.95)
+    #[arg(long, value_name = "BITS")]
+    max_entropy: Option<f64>,
 
     /// Limit Rayon worker threads
     #[arg(long, value_name = "N")]
@@ -290,7 +310,7 @@ impl ChunkCombiner for FirstChunkCombiner {
             first.byte_len
         );
         Ok(CombinationOutput {
-            model: first.model.clone(),
+            model: first.model.as_ref().clone(),
             detail,
             stats: CombineStats {
                 merges_requested: requested,
@@ -429,16 +449,10 @@ impl ChunkCombiner for EntropyFrequencyCombiner {
 struct ChunkTrainingSnapshot {
     index: usize,
     byte_len: usize,
-    model: BpeModel,
+    model: Arc<BpeModel>,
 }
 
-struct CachedChunk {
-    first_index: usize,
-    summary: ChunkSummary,
-    snapshot: ChunkTrainingSnapshot,
-}
-
-#[derive(Serialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 struct ChunkMergeRecord {
     iteration: usize,
     left: String,
@@ -447,14 +461,30 @@ struct ChunkMergeRecord {
     merges_applied: usize,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Clone)]
 struct ChunkSummary {
     index: usize,
     byte_len: usize,
     entropy_bits: f64,
     vocab_size: usize,
     merge_count: usize,
-    merges: Vec<ChunkMergeRecord>,
+    merges: Arc<Vec<ChunkMergeRecord>>,
+}
+
+impl Serialize for ChunkSummary {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("ChunkSummary", 6)?;
+        state.serialize_field("index", &self.index)?;
+        state.serialize_field("byte_len", &self.byte_len)?;
+        state.serialize_field("entropy_bits", &self.entropy_bits)?;
+        state.serialize_field("vocab_size", &self.vocab_size)?;
+        state.serialize_field("merge_count", &self.merge_count)?;
+        state.serialize_field("merges", &*self.merges)?;
+        state.end()
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -470,12 +500,16 @@ struct ChunkTrainReport {
     chunk_size_bytes: usize,
     trainer_vocab_size: usize,
     trainer_min_frequency: usize,
+    trainer_min_entropy: Option<f64>,
+    trainer_max_entropy: Option<f64>,
     total_bytes: usize,
     processed_chunks: usize,
     total_chunks: usize,
     duplicate_mode: String,
     duplicate_chunks_reused: usize,
     duplicate_chunks_skipped: usize,
+    skipped_low_entropy: usize,
+    skipped_high_entropy: usize,
     combine_mode: String,
     combine_detail: String,
     combine_stats: CombineStats,
@@ -513,7 +547,7 @@ impl AggregatedMerge {
 fn aggregate_chunk_merges(summaries: &[ChunkSummary]) -> Vec<AggregatedMerge> {
     let mut map: FxHashMap<MergeBytesKey, AggregatedMergeStats> = FxHashMap::default();
     for summary in summaries {
-        for merge in &summary.merges {
+        for merge in summary.merges.iter() {
             let key = MergeBytesKey {
                 left: latin1_to_bytes(&merge.left),
                 right: latin1_to_bytes(&merge.right),
@@ -550,7 +584,7 @@ fn aggregate_chunk_merges_weighted(
             .get(summary.index)
             .copied()
             .unwrap_or(fallback_weight);
-        for merge in &summary.merges {
+        for merge in summary.merges.iter() {
             let key = MergeBytesKey {
                 left: latin1_to_bytes(&merge.left),
                 right: latin1_to_bytes(&merge.right),
@@ -895,7 +929,7 @@ fn run_train(args: TrainArgs) -> Result<()> {
         Some(pb)
     };
 
-    let trainer = Trainer::new(trainer_cfg.clone());
+    let trainer = Arc::new(Trainer::new(trainer_cfg.clone()));
     let start = Instant::now();
     let artifacts = trainer.train_from_sequences(&sequences)?;
     drop(sequences);
@@ -946,6 +980,15 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         return Err(anyhow!("chunk-size must be greater than zero"));
     }
 
+    let min_entropy = args.min_entropy.unwrap_or(DEFAULT_MIN_ENTROPY).max(0.0);
+    let max_entropy = args.max_entropy.unwrap_or(DEFAULT_MAX_ENTROPY).min(8.0);
+
+    if min_entropy > max_entropy {
+        return Err(anyhow!(
+            "min-entropy threshold ({min_entropy}) cannot exceed max-entropy ({max_entropy})"
+        ));
+    }
+
     if let Some(threads) = args.threads {
         ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -982,12 +1025,12 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
     let mut chunk_summaries: Vec<ChunkSummary> = Vec::new();
     let mut snapshots: Vec<ChunkTrainingSnapshot> = Vec::new();
 
-    let chunks =
-        load_binary_corpus(&args.inputs, &ingest_cfg).with_context(|| "failed to load corpus")?;
-    let total_chunks = chunks.len();
-    let total_bytes: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+    let chunk_stream = stream_binary_corpus(&args.inputs, &ingest_cfg)
+        .with_context(|| "failed to initialise corpus stream")?;
+    let total_chunks = chunk_stream.total_chunks();
+    let total_bytes = chunk_stream.total_bytes();
     info!(
-        "loaded {} chunks totalling {:.2} MiB",
+        "discovered {} chunk candidates totalling {:.2} MiB",
         total_chunks,
         bytes_to_mebibytes(total_bytes)
     );
@@ -1006,155 +1049,346 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         Some(pb)
     };
 
-    let mut cache: FxHashMap<blake3::Hash, CachedChunk> = FxHashMap::default();
+    let progress_for_workers = progress.as_ref().map(|pb| pb.clone());
+
+    let min_entropy = args.min_entropy;
+    let max_entropy = args.max_entropy;
+
+    let skipped_low_entropy_counter = Arc::new(AtomicUsize::new(0));
+    let skipped_high_entropy_counter = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Debug)]
+    struct ChunkResultCore {
+        byte_len: usize,
+        entropy_bits: f64,
+        vocab_size: usize,
+        merge_count: usize,
+        merges: Arc<Vec<ChunkMergeRecord>>,
+        model: Arc<BpeModel>,
+    }
+
+    #[derive(Debug)]
+    struct ChunkMeta {
+        first_index: usize,
+        skipped: bool,
+    }
+
+    struct CacheEntry {
+        first_index: usize,
+        handle: Arc<OnceLock<Option<Arc<ChunkResultCore>>>>,
+    }
+
+    let cache = Arc::new(Mutex::new(FxHashMap::<blake3::Hash, CacheEntry>::default()));
+    let result_slots = Arc::new(
+        (0..total_chunks)
+            .map(|_| OnceLock::<Option<Arc<ChunkResultCore>>>::new())
+            .collect::<Vec<_>>(),
+    );
+    let meta_slots = Arc::new(
+        (0..total_chunks)
+            .map(|_| OnceLock::<ChunkMeta>::new())
+            .collect::<Vec<_>>(),
+    );
+
+    let cache_ref = Arc::clone(&cache);
+    let result_slots_ref = Arc::clone(&result_slots);
+    let meta_slots_ref = Arc::clone(&meta_slots);
+
+    let skipped_low_entropy_ref = Arc::clone(&skipped_low_entropy_counter);
+    let skipped_high_entropy_ref = Arc::clone(&skipped_high_entropy_counter);
+    chunk_stream
+        .enumerate()
+        .par_bridge()
+        .try_for_each(move |(index, chunk_res)| -> Result<()> {
+            let chunk = chunk_res
+                .with_context(|| format!("failed to read chunk {index}"))?;
+            let byte_len = chunk.len();
+            let entropy_bits = compute_entropy_bits(&chunk);
+            let chunk_hash = blake3::hash(&chunk);
+
+            let (first_index, handle) = {
+                let mut guard = cache_ref.lock().expect("chunk cache poisoned");
+                match guard.entry(chunk_hash) {
+                    Entry::Vacant(slot) => {
+                        let cursor = Arc::new(OnceLock::new());
+                        slot.insert(CacheEntry {
+                            first_index: index,
+                            handle: cursor.clone(),
+                        });
+                        (index, cursor)
+                    }
+                    Entry::Occupied(slot) => {
+                        let cached = slot.get();
+                        (cached.first_index, cached.handle.clone())
+                    }
+                }
+            };
+
+            let mut skipped = false;
+
+            if first_index == index {
+                let below_min = min_entropy.is_some_and(|min| entropy_bits < min);
+                let above_max = max_entropy.is_some_and(|max| entropy_bits > max);
+
+                if below_min {
+                    skipped_low_entropy_ref.fetch_add(1, Ordering::Relaxed);
+                }
+                if above_max {
+                    skipped_high_entropy_ref.fetch_add(1, Ordering::Relaxed);
+                }
+
+                if below_min || above_max {
+                    handle
+                        .set(None)
+                        .map_err(|_| anyhow!("chunk result initialised multiple times"))?;
+                    result_slots_ref[index]
+                        .set(None)
+                        .map_err(|_| anyhow!("chunk result already written"))?;
+                    skipped = true;
+
+                    if let Some(pb) = progress_for_workers.as_ref() {
+                        pb.inc(1);
+                        pb.suspend(|| {
+                            info!(
+                                "chunk {}/{} ({:.2} MiB) entropy {:.2} bits filtered by thresholds",
+                                index + 1,
+                                total_chunks,
+                                bytes_to_mebibytes(byte_len),
+                                entropy_bits
+                            );
+                        });
+                    } else {
+                        info!(
+                            "chunk {}/{} ({:.2} MiB) entropy {:.2} bits filtered by thresholds",
+                            index + 1,
+                            total_chunks,
+                            bytes_to_mebibytes(byte_len),
+                            entropy_bits
+                        );
+                    }
+                } else {
+                    if let Some(pb) = progress_for_workers.as_ref() {
+                        pb.set_message(format!(
+                            "training chunk {}/{} ({:.2} MiB)",
+                            index + 1,
+                            total_chunks,
+                            bytes_to_mebibytes(byte_len)
+                        ));
+                    }
+
+                    let sequences = vec![chunk];
+                    let artifacts = trainer
+                        .train_from_sequences(&sequences)
+                        .with_context(|| format!("failed to train chunk {index}"))?;
+                    let TrainerArtifacts { model, metrics } = artifacts;
+
+                    let model = Arc::new(model);
+                    let vocab_size = model.vocab_size();
+                    let token_bytes = model.token_bytes();
+                    let merges = model.merges();
+                    let iteration_metrics = metrics.iterations;
+
+                    let mut merge_records_vec = Vec::with_capacity(merges.len());
+                    for (merge_idx, &(left_id, right_id)) in merges.iter().enumerate() {
+                        let left = bytes_to_latin1(&token_bytes[left_id as usize]);
+                        let right = bytes_to_latin1(&token_bytes[right_id as usize]);
+                        let metrics = iteration_metrics.get(merge_idx);
+                        let (best_frequency, merges_applied) = metrics
+                            .map(|m| (m.best_frequency, m.merges_applied))
+                            .unwrap_or((0, 0));
+                        merge_records_vec.push(ChunkMergeRecord {
+                            iteration: merge_idx + 1,
+                            left,
+                            right,
+                            best_frequency,
+                            merges_applied,
+                        });
+                    }
+
+                    let merge_records = Arc::new(merge_records_vec);
+                    let merge_count = merge_records.len();
+
+                    let result = Arc::new(ChunkResultCore {
+                        byte_len,
+                        entropy_bits,
+                        vocab_size,
+                        merge_count,
+                        merges: Arc::clone(&merge_records),
+                        model: Arc::clone(&model),
+                    });
+
+                    handle
+                        .set(Some(result.clone()))
+                        .map_err(|_| anyhow!("chunk result initialised multiple times"))?;
+                    result_slots_ref[index]
+                        .set(Some(result.clone()))
+                        .map_err(|_| anyhow!("chunk result already written"))?;
+
+                    if let Some(pb) = progress_for_workers.as_ref() {
+                        pb.inc(1);
+                        pb.suspend(|| {
+                            info!(
+                                "chunk {}/{} ({:.2} MiB) => vocab {} ({} merges, entropy {:.2} bits)",
+                                index + 1,
+                                total_chunks,
+                                bytes_to_mebibytes(byte_len),
+                                vocab_size,
+                                merge_count,
+                                entropy_bits
+                            );
+                        });
+                    } else {
+                        info!(
+                            "chunk {}/{} ({:.2} MiB) => vocab {} ({} merges, entropy {:.2} bits)",
+                            index + 1,
+                            total_chunks,
+                            bytes_to_mebibytes(byte_len),
+                            vocab_size,
+                            merge_count,
+                            entropy_bits
+                        );
+                    }
+                }
+            } else {
+                let result_option = loop {
+                    if let Some(result) = handle.get() {
+                        break result.clone();
+                    }
+                    std::thread::yield_now();
+                };
+
+                match result_option {
+                    Some(arc) => {
+                        result_slots_ref[index]
+                            .set(Some(arc.clone()))
+                            .map_err(|_| anyhow!("duplicate chunk result already written"))?;
+
+                        let hash_hex = chunk_hash.to_hex().to_string();
+                        let hash_preview = hash_hex.get(..12).unwrap_or(&hash_hex);
+
+                        if let Some(pb) = progress_for_workers.as_ref() {
+                            pb.inc(1);
+                            pb.suspend(|| {
+                                info!(
+                                    "chunk {}/{} duplicate of chunk {} (hash {}...) => vocab {} ({} merges, entropy {:.2} bits)",
+                                    index + 1,
+                                    total_chunks,
+                                    first_index + 1,
+                                    hash_preview,
+                                    arc.vocab_size,
+                                    arc.merge_count,
+                                    arc.entropy_bits
+                                );
+                            });
+                        } else {
+                            info!(
+                                "chunk {}/{} duplicate of chunk {} (hash {}...) => vocab {} ({} merges, entropy {:.2} bits)",
+                                index + 1,
+                                total_chunks,
+                                first_index + 1,
+                                hash_preview,
+                                arc.vocab_size,
+                                arc.merge_count,
+                                arc.entropy_bits
+                            );
+                        }
+                    }
+                    None => {
+                        skipped = true;
+                        result_slots_ref[index]
+                            .set(None)
+                            .map_err(|_| anyhow!("duplicate chunk result already written"))?;
+
+                        if let Some(pb) = progress_for_workers.as_ref() {
+                            pb.inc(1);
+                            pb.suspend(|| {
+                                info!(
+                                    "chunk {}/{} duplicate of chunk {} skipped due to entropy filter",
+                                    index + 1,
+                                    total_chunks,
+                                    first_index + 1
+                                );
+                            });
+                        } else {
+                            info!(
+                                "chunk {}/{} duplicate of chunk {} skipped due to entropy filter",
+                                index + 1,
+                                total_chunks,
+                                first_index + 1
+                            );
+                        }
+                    }
+                }
+            }
+
+            meta_slots_ref[index]
+                .set(ChunkMeta { first_index, skipped })
+                .ok();
+
+            Ok(())
+        })?;
+
+    let result_slots = Arc::try_unwrap(result_slots)
+        .expect("result slots still referenced")
+        .into_iter()
+        .map(|slot| slot.into_inner().unwrap_or(None))
+        .collect::<Vec<_>>();
+    let meta_slots = Arc::try_unwrap(meta_slots)
+        .expect("metadata slots still referenced")
+        .into_iter()
+        .map(|slot| slot.into_inner().expect("missing chunk metadata"))
+        .collect::<Vec<_>>();
+
     let mut duplicate_chunks_reused = 0usize;
     let mut duplicate_chunks_skipped = 0usize;
 
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        let chunk_hash = blake3::hash(&chunk);
-        if let Some(entry) = cache.get(&chunk_hash) {
-            let hash_hex = chunk_hash.to_hex().to_string();
-            let hash_preview = hash_hex.get(..12).unwrap_or(&hash_hex);
-
-            let mut summary = entry.summary.clone();
-            let next_index = chunk_summaries.len();
-            summary.index = next_index;
-            let mut snapshot = entry.snapshot.clone();
-            snapshot.index = next_index;
-
-            if args.duplicate_mode.counts_duplicates() {
-                chunk_summaries.push(summary);
-                snapshots.push(snapshot);
-                duplicate_chunks_reused = duplicate_chunks_reused.saturating_add(1);
-            } else {
-                duplicate_chunks_skipped = duplicate_chunks_skipped.saturating_add(1);
-            }
-
-            if let Some(pb) = progress.as_ref() {
-                pb.inc(1);
-                pb.suspend(|| {
-                    info!(
-                        "chunk {}/{} duplicate of chunk {} (hash {}...) => vocab {} ({} merges, entropy {:.2} bits)",
-                        index + 1,
-                        total_chunks,
-                        entry.first_index + 1,
-                        hash_preview,
-                        entry.summary.vocab_size,
-                        entry.summary.merge_count,
-                        entry.summary.entropy_bits
-                    );
-                });
-            } else {
-                info!(
-                    "chunk {}/{} duplicate of chunk {} (hash {}...) => vocab {} ({} merges, entropy {:.2} bits)",
-                    index + 1,
-                    total_chunks,
-                    entry.first_index + 1,
-                    hash_preview,
-                    entry.summary.vocab_size,
-                    entry.summary.merge_count,
-                    entry.summary.entropy_bits
-                );
-            }
-
+    for (index, (meta, result)) in meta_slots.iter().zip(result_slots.iter()).enumerate() {
+        if meta.skipped {
             continue;
         }
 
-        let byte_len = chunk.len();
-        let entropy_bits = compute_entropy_bits(&chunk);
-        if let Some(pb) = progress.as_ref() {
-            let msg = format!(
-                "training chunk {}/{} ({:.2} MiB)",
-                index + 1,
-                total_chunks,
-                bytes_to_mebibytes(byte_len)
-            );
-            pb.set_message(msg);
+        let result = match result {
+            Some(result) => result,
+            None => continue,
+        };
+
+        let is_duplicate = meta.first_index != index;
+        if is_duplicate && !args.duplicate_mode.counts_duplicates() {
+            duplicate_chunks_skipped = duplicate_chunks_skipped.saturating_add(1);
+            continue;
         }
-
-        let mut sequences = Vec::with_capacity(1);
-        sequences.push(chunk);
-        let artifacts = trainer
-            .train_from_sequences(&sequences)
-            .with_context(|| format!("failed to train chunk {index}"))?;
-        drop(sequences);
-
-        let model = artifacts.model.clone();
-        let vocab_size = model.vocab_size();
-        let token_bytes = model.token_bytes();
-        let merges = model.merges();
-        let iteration_metrics = &artifacts.metrics.iterations;
-
-        let mut merge_records = Vec::with_capacity(merges.len());
-        for (merge_idx, &(left_id, right_id)) in merges.iter().enumerate() {
-            let left = bytes_to_latin1(&token_bytes[left_id as usize]);
-            let right = bytes_to_latin1(&token_bytes[right_id as usize]);
-            let metrics = iteration_metrics.get(merge_idx);
-            let (best_frequency, merges_applied) = metrics
-                .map(|m| (m.best_frequency, m.merges_applied))
-                .unwrap_or((0, 0));
-            merge_records.push(ChunkMergeRecord {
-                iteration: merge_idx + 1,
-                left,
-                right,
-                best_frequency,
-                merges_applied,
-            });
+        if is_duplicate {
+            duplicate_chunks_reused = duplicate_chunks_reused.saturating_add(1);
         }
-        let merge_count = merge_records.len();
 
         let next_index = chunk_summaries.len();
-
         let summary = ChunkSummary {
             index: next_index,
-            byte_len,
-            entropy_bits,
-            vocab_size,
-            merge_count,
-            merges: merge_records,
+            byte_len: result.byte_len,
+            entropy_bits: result.entropy_bits,
+            vocab_size: result.vocab_size,
+            merge_count: result.merge_count,
+            merges: Arc::clone(&result.merges),
         };
 
         let snapshot = ChunkTrainingSnapshot {
             index: next_index,
-            byte_len,
-            model,
+            byte_len: result.byte_len,
+            model: Arc::clone(&result.model),
         };
 
-        cache.insert(
-            chunk_hash,
-            CachedChunk {
-                first_index: index,
-                summary: summary.clone(),
-                snapshot: snapshot.clone(),
-            },
-        );
         chunk_summaries.push(summary);
         snapshots.push(snapshot);
+    }
 
-        if let Some(pb) = progress.as_ref() {
-            pb.inc(1);
-            pb.suspend(|| {
-                info!(
-                    "chunk {}/{} ({:.2} MiB) => vocab {} ({} merges, entropy {:.2} bits)",
-                    index + 1,
-                    total_chunks,
-                    bytes_to_mebibytes(byte_len),
-                    vocab_size,
-                    merge_count,
-                    entropy_bits
-                );
-            });
-        } else {
-            info!(
-                "chunk {}/{} ({:.2} MiB) => vocab {} ({} merges, entropy {:.2} bits)",
-                index + 1,
-                total_chunks,
-                bytes_to_mebibytes(byte_len),
-                vocab_size,
-                merge_count,
-                entropy_bits
-            );
-        }
+    let skipped_low_entropy = skipped_low_entropy_counter.load(Ordering::Relaxed);
+    let skipped_high_entropy = skipped_high_entropy_counter.load(Ordering::Relaxed);
+
+    if skipped_low_entropy > 0 || skipped_high_entropy > 0 {
+        info!(
+            "filtered {} chunk(s) below min-entropy and {} chunk(s) above max-entropy",
+            skipped_low_entropy, skipped_high_entropy
+        );
     }
 
     if let Some(pb) = progress {
@@ -1186,7 +1420,11 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         combiner.name()
     );
     let combination = combiner.combine(&snapshots, &chunk_summaries, &trainer_cfg)?;
-    let final_model = combination.model;
+    let CombinationOutput {
+        model: final_model,
+        detail: combine_detail,
+        stats: combine_stats,
+    } = combination;
 
     if let Some(parent) = args.output.parent() {
         if !parent.as_os_str().is_empty() {
@@ -1203,48 +1441,107 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
             )
         })?;
 
-    let report = ChunkTrainReport {
-        chunk_size_bytes: args.chunk_size,
-        trainer_vocab_size: trainer_cfg.target_vocab_size,
-        trainer_min_frequency: trainer_cfg.min_frequency,
-        total_bytes,
-        processed_chunks: total_chunks,
-        total_chunks: snapshots.len(),
-        duplicate_mode: args.duplicate_mode.to_string(),
-        duplicate_chunks_reused,
-        duplicate_chunks_skipped,
-        combine_mode: args.combine_mode.to_string(),
-        combine_detail: combination.detail,
-        combine_stats: combination.stats.clone(),
-        final_vocab_size: final_model.vocab_size(),
-        chunks: chunk_summaries,
-    };
+    let combined_chunks = snapshots.len();
 
-    if let Some(parent) = args.report.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+    if args.no_report {
+        // Free heavy per-chunk summaries before printing to reduce peak memory.
+        drop(chunk_summaries);
+        drop(snapshots);
+
+        println!(
+            "🧪 chunk-train combined {} chunks ({} bytes across {} processed chunks) using {} -> {}",
+            combined_chunks,
+            total_bytes,
+            total_chunks,
+            args.combine_mode,
+            args.output.display()
+        );
+        println!("   combine detail: {}", combine_detail);
+        println!(
+            "   duplicate mode: {} (reused {}, skipped {})",
+            args.duplicate_mode, duplicate_chunks_reused, duplicate_chunks_skipped
+        );
+        if args.min_entropy.is_some() || args.max_entropy.is_some() {
+            let min_display = args
+                .min_entropy
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "none".to_string());
+            let max_display = args
+                .max_entropy
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "   entropy filter: min {} max {} (skipped low {}, high {})",
+                min_display, max_display, skipped_low_entropy, skipped_high_entropy
+            );
         }
-    }
-    let report_json =
-        serde_json::to_string_pretty(&report).context("failed to serialise chunk report")?;
-    fs::write(&args.report, report_json)
-        .with_context(|| format!("failed to write chunk report to {}", args.report.display()))?;
+        println!("   chunk report disabled (--no-report)");
+    } else {
+        let report = ChunkTrainReport {
+            chunk_size_bytes: args.chunk_size,
+            trainer_vocab_size: trainer_cfg.target_vocab_size,
+            trainer_min_frequency: trainer_cfg.min_frequency,
+            trainer_min_entropy: args.min_entropy,
+            trainer_max_entropy: args.max_entropy,
+            total_bytes,
+            processed_chunks: total_chunks,
+            total_chunks: combined_chunks,
+            duplicate_mode: args.duplicate_mode.to_string(),
+            duplicate_chunks_reused,
+            duplicate_chunks_skipped,
+            skipped_low_entropy,
+            skipped_high_entropy,
+            combine_mode: args.combine_mode.to_string(),
+            combine_detail: combine_detail.clone(),
+            combine_stats: combine_stats.clone(),
+            final_vocab_size: final_model.vocab_size(),
+            chunks: chunk_summaries,
+        };
 
-    println!(
-        "🧪 chunk-train combined {} chunks ({} bytes across {} processed chunks) using {} -> {}",
-        report.total_chunks,
-        report.total_bytes,
-        report.processed_chunks,
-        args.combine_mode,
-        args.output.display()
-    );
-    println!("   combine detail: {}", report.combine_detail);
-    println!(
-        "   duplicate mode: {} (reused {}, skipped {})",
-        report.duplicate_mode, report.duplicate_chunks_reused, report.duplicate_chunks_skipped
-    );
-    println!("   report written to {}", args.report.display());
+        if let Some(parent) = args.report.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+        }
+        let mut report_file = File::create(&args.report).with_context(|| {
+            format!("failed to write chunk report to {}", args.report.display())
+        })?;
+        serde_json::to_writer_pretty(&mut report_file, &report)
+            .context("failed to serialise chunk report")?;
+        report_file.write_all(b"\n").with_context(|| {
+            format!("failed to finalise chunk report {}", args.report.display())
+        })?;
+
+        println!(
+            "🧪 chunk-train combined {} chunks ({} bytes across {} processed chunks) using {} -> {}",
+            report.total_chunks,
+            report.total_bytes,
+            report.processed_chunks,
+            args.combine_mode,
+            args.output.display()
+        );
+        println!("   combine detail: {}", report.combine_detail);
+        println!(
+            "   duplicate mode: {} (reused {}, skipped {})",
+            report.duplicate_mode, report.duplicate_chunks_reused, report.duplicate_chunks_skipped
+        );
+        if args.min_entropy.is_some() || args.max_entropy.is_some() {
+            let min_display = args
+                .min_entropy
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "none".to_string());
+            let max_display = args
+                .max_entropy
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "   entropy filter: min {} max {} (skipped low {}, high {})",
+                min_display, max_display, skipped_low_entropy, skipped_high_entropy
+            );
+        }
+        println!("   report written to {}", args.report.display());
+    }
 
     Ok(())
 }
