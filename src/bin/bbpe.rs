@@ -552,7 +552,7 @@ fn aggregate_chunk_merges(summaries: &[ChunkSummary]) -> Vec<AggregatedMerge> {
                 left: latin1_to_bytes(&merge.left),
                 right: latin1_to_bytes(&merge.right),
             };
-            let entry = map.entry(key).or_insert_with(AggregatedMergeStats::default);
+            let entry = map.entry(key).or_default();
             entry.total_frequency = entry.total_frequency.saturating_add(merge.best_frequency);
             entry.weighted_frequency += merge.best_frequency as f64;
             entry.chunk_support = entry.chunk_support.saturating_add(1);
@@ -589,7 +589,7 @@ fn aggregate_chunk_merges_weighted(
                 left: latin1_to_bytes(&merge.left),
                 right: latin1_to_bytes(&merge.right),
             };
-            let entry = map.entry(key).or_insert_with(AggregatedMergeStats::default);
+            let entry = map.entry(key).or_default();
             entry.total_frequency = entry.total_frequency.saturating_add(merge.best_frequency);
             entry.weighted_frequency += (merge.best_frequency as f64) * weight;
             entry.chunk_support = entry.chunk_support.saturating_add(1);
@@ -1049,7 +1049,7 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         Some(pb)
     };
 
-    let progress_for_workers = progress.as_ref().map(|pb| pb.clone());
+    let progress_for_workers = progress.clone();
 
     let min_entropy = args.min_entropy;
     let max_entropy = args.max_entropy;
@@ -1386,8 +1386,7 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
 
     if skipped_low_entropy > 0 || skipped_high_entropy > 0 {
         info!(
-            "filtered {} chunk(s) below min-entropy and {} chunk(s) above max-entropy",
-            skipped_low_entropy, skipped_high_entropy
+            "filtered {skipped_low_entropy} chunk(s) below min-entropy and {skipped_high_entropy} chunk(s) above max-entropy"
         );
     }
 
@@ -1456,7 +1455,7 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
             args.combine_mode,
             args.output.display()
         );
-        println!("   combine detail: {}", combine_detail);
+        println!("   combine detail: {combine_detail}");
         println!(
             "   duplicate mode: {} (reused {}, skipped {})",
             args.duplicate_mode, duplicate_chunks_reused, duplicate_chunks_skipped
@@ -1471,8 +1470,7 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
                 .map(|v| format!("{v:.4}"))
                 .unwrap_or_else(|| "none".to_string());
             println!(
-                "   entropy filter: min {} max {} (skipped low {}, high {})",
-                min_display, max_display, skipped_low_entropy, skipped_high_entropy
+                "   entropy filter: min {min_display} max {max_display} (skipped low {skipped_low_entropy}, high {skipped_high_entropy})"
             );
         }
         println!("   chunk report disabled (--no-report)");
@@ -1536,8 +1534,7 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
                 .map(|v| format!("{v:.4}"))
                 .unwrap_or_else(|| "none".to_string());
             println!(
-                "   entropy filter: min {} max {} (skipped low {}, high {})",
-                min_display, max_display, skipped_low_entropy, skipped_high_entropy
+                "   entropy filter: min {min_display} max {max_display} (skipped low {skipped_low_entropy}, high {skipped_high_entropy})"
             );
         }
         println!("   report written to {}", args.report.display());

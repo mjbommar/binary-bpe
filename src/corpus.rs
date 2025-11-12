@@ -150,7 +150,7 @@ pub fn stream_binary_corpus<P: AsRef<Path>>(
             total_chunks = total_chunks.saturating_add(1);
         } else {
             let size = u64::try_from(chunk_size).map_err(|_| {
-                BbpeError::InvalidConfig(format!("chunk size {} exceeds u64::MAX", chunk_size))
+                BbpeError::InvalidConfig(format!("chunk size {chunk_size} exceeds u64::MAX"))
             })?;
             let mut chunks = file_len / size;
             if file_len % size != 0 {
