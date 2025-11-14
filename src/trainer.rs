@@ -12,10 +12,11 @@ use rustc_hash::FxHashMap;
 
 use crate::bytes::is_allowed_length;
 use crate::config::{IngestConfig, TrainerBuilder, TrainerConfig};
-use crate::corpus::load_binary_corpus;
+use crate::corpus::{load_binary_corpus, load_jsonl_corpus, JsonlSpec};
 use crate::error::{BbpeError, Result};
 use crate::metrics::{sample_rss_kb, IterationMetrics, StopReason, TrainingMetrics};
 use crate::model::{BpeModel, Pair, TokenId};
+use crate::preprocess::apply_preprocessor;
 
 /// High-level façade configuring and executing BPE training runs.
 #[derive(Debug, Clone)]
@@ -62,6 +63,12 @@ impl Trainer {
         self.train_from_sequences(&sequences)
     }
 
+    /// Trains a model by extracting string fields from newline-delimited JSON (JSONL) files.
+    pub fn train_from_jsonl(&self, specs: &[JsonlSpec]) -> Result<TrainerArtifacts> {
+        let sequences = load_jsonl_corpus(specs)?;
+        self.train_from_sequences(&sequences)
+    }
+
     /// Trains a model from in-memory byte sequences.
     pub fn train_from_sequences(&self, sequences: &[Vec<u8>]) -> Result<TrainerArtifacts> {
         if sequences.is_empty() {
@@ -70,6 +77,14 @@ impl Trainer {
             ));
         }
         self.cfg.validate()?;
+
+        let preprocessed = apply_preprocessor(&self.cfg.preprocessor, sequences);
+        let sequences = preprocessed.as_slice();
+        if sequences.is_empty() {
+            return Err(BbpeError::InvalidConfig(
+                 "preprocessing removed all sequences; adjust the preprocessor or provide non-empty spans".into(),
+             ));
+        }
 
         let base_vocab = 256usize;
         let special_count = self.cfg.special_tokens.len();

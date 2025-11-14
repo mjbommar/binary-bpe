@@ -3,15 +3,15 @@ use std::convert::TryFrom;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bbpe::bytes::{bytes_to_latin1, latin1_to_bytes};
-use bbpe::config::{IngestConfig, TrainerConfig};
-use bbpe::corpus::{load_binary_corpus, stream_binary_corpus};
+use bbpe::config::{IngestConfig, PreprocessorConfig, PreprocessorKind, TrainerConfig};
+use bbpe::corpus::{load_binary_corpus, load_jsonl_corpus, stream_binary_corpus, JsonlSpec};
 use bbpe::model::{Pair, TokenId};
 use bbpe::serialization;
 use bbpe::{BinaryTokenizer, BpeModel, Trainer, TrainerArtifacts};
@@ -62,9 +62,13 @@ enum Commands {
 
 #[derive(Args, Debug)]
 struct TrainArgs {
-    /// Files or directories to ingest
-    #[arg(required = true)]
+    /// Files or directories to ingest (optional when using --jsonl)
+    #[arg(required = false)]
     inputs: Vec<PathBuf>,
+
+    /// JSONL inputs specified as `PATH:field.path` (repeat flag)
+    #[arg(long = "jsonl", value_name = "PATH:FIELD")]
+    jsonl_inputs: Vec<JsonlSpec>,
 
     /// Output path for tokenizer.json
     #[arg(short, long, value_name = "PATH", default_value = DEFAULT_OUTPUT)]
@@ -93,6 +97,24 @@ struct TrainArgs {
     /// Append additional special tokens
     #[arg(long = "special-token", value_name = "TOKEN")]
     special_tokens: Vec<String>,
+
+    /// Preprocessor applied before merge counting
+    #[arg(
+        long = "preprocessor",
+        value_enum,
+        default_value_t = PreprocessorCli::None
+    )]
+    preprocessor: PreprocessorCli,
+    /// Probability that each detected delimiter boundary is preserved (0.0-1.0)
+    #[arg(
+        long = "preprocessor-probability",
+        value_name = "P",
+        default_value_t = 1.0
+    )]
+    preprocessor_probability: f64,
+    /// Optional RNG seed controlling probabilistic preprocessing
+    #[arg(long = "preprocessor-seed", value_name = "SEED")]
+    preprocessor_seed: Option<u64>,
 
     /// Maximum merge iterations
     #[arg(long, value_name = "COUNT")]
@@ -137,6 +159,14 @@ struct TrainArgs {
     /// Maximum entropy threshold in bits/byte for filtering chunks (e.g., 7.0)
     #[arg(long, value_name = "BITS")]
     max_entropy: Option<f64>,
+
+    /// Additional vocabulary sizes to derive within the tokenizer family
+    #[arg(long = "family-size", value_name = "SIZE")]
+    family_sizes: Vec<usize>,
+
+    /// Output template for derived family members (supports `{size}`)
+    #[arg(long = "family-template", value_name = "PATTERN")]
+    family_template: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -181,6 +211,24 @@ struct ChunkTrainArgs {
     #[arg(long = "special-token", value_name = "TOKEN")]
     special_tokens: Vec<String>,
 
+    /// Preprocessor applied before merge counting
+    #[arg(
+        long = "preprocessor",
+        value_enum,
+        default_value_t = PreprocessorCli::None
+    )]
+    preprocessor: PreprocessorCli,
+    /// Probability that each detected delimiter boundary is preserved (0.0-1.0)
+    #[arg(
+        long = "preprocessor-probability",
+        value_name = "P",
+        default_value_t = 1.0
+    )]
+    preprocessor_probability: f64,
+    /// Optional RNG seed controlling probabilistic preprocessing
+    #[arg(long = "preprocessor-seed", value_name = "SEED")]
+    preprocessor_seed: Option<u64>,
+
     /// Maximum merge iterations
     #[arg(long, value_name = "COUNT")]
     max_merge_iterations: Option<usize>,
@@ -216,6 +264,14 @@ struct ChunkTrainArgs {
     /// Handling mode for duplicate chunk contents
     #[arg(long = "duplicates", value_enum, default_value_t = ChunkDuplicateMode::Count)]
     duplicate_mode: ChunkDuplicateMode,
+
+    /// Additional vocabulary sizes to derive within the tokenizer family
+    #[arg(long = "family-size", value_name = "SIZE")]
+    family_sizes: Vec<usize>,
+
+    /// Output template for derived family members (supports `{size}`)
+    #[arg(long = "family-template", value_name = "PATTERN")]
+    family_template: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -274,6 +330,43 @@ impl fmt::Display for ChunkDuplicateMode {
             Self::Unique => "unique",
         };
         f.write_str(label)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum PreprocessorCli {
+    /// Disable preprocessing and operate on raw byte sequences.
+    None,
+    /// Split on ASCII whitespace runs.
+    AsciiWhitespace,
+    /// Split on Unicode whitespace runs.
+    UnicodeWhitespace,
+    /// Split on contiguous null-byte runs, useful for binary corpora.
+    NullDelimited,
+}
+
+impl From<PreprocessorCli> for PreprocessorConfig {
+    fn from(value: PreprocessorCli) -> Self {
+        let kind = match value {
+            PreprocessorCli::None => PreprocessorKind::None,
+            PreprocessorCli::AsciiWhitespace => PreprocessorKind::AsciiWhitespace,
+            PreprocessorCli::UnicodeWhitespace => PreprocessorKind::UnicodeWhitespace,
+            PreprocessorCli::NullDelimited => PreprocessorKind::NullDelimited,
+        };
+        PreprocessorConfig {
+            kind,
+            split_probability: 1.0,
+            seed: None,
+        }
+    }
+}
+
+impl PreprocessorCli {
+    fn into_config(self, probability: f64, seed: Option<u64>) -> PreprocessorConfig {
+        let mut cfg: PreprocessorConfig = self.into();
+        cfg.split_probability = probability;
+        cfg.seed = seed;
+        cfg
     }
 }
 
@@ -879,6 +972,12 @@ fn run_train(args: TrainArgs) -> Result<()> {
             .context("unable to configure Rayon thread pool")?;
     }
 
+    if args.inputs.is_empty() && args.jsonl_inputs.is_empty() {
+        return Err(anyhow!(
+            "provide at least one filesystem input or --jsonl <PATH:FIELD>"
+        ));
+    }
+
     let defaults = TrainerConfig::default();
     let mut cfg = TrainerConfig::builder();
     if let Some(vocab_size) = args.vocab_size {
@@ -908,6 +1007,10 @@ fn run_train(args: TrainArgs) -> Result<()> {
     cfg = cfg.max_merge_iterations(args.max_merge_iterations);
     cfg = cfg.plateau_stop_enabled(args.plateau_stop);
     cfg = cfg.show_progress(!args.no_progress);
+    cfg = cfg.preprocessor(
+        args.preprocessor
+            .into_config(args.preprocessor_probability, args.preprocessor_seed),
+    );
     let trainer_cfg = cfg.build()?;
 
     let ingest_cfg = IngestConfig {
@@ -916,11 +1019,42 @@ fn run_train(args: TrainArgs) -> Result<()> {
         follow_symlinks: args.follow_symlinks,
     };
 
-    let mut sequences = load_binary_corpus(&args.inputs, &ingest_cfg)
-        .with_context(|| "failed to load binary corpus")?;
+    let mut sequences: Vec<Vec<u8>> = Vec::new();
+
+    if !args.inputs.is_empty() {
+        let mut binary_sequences = load_binary_corpus(&args.inputs, &ingest_cfg)
+            .with_context(|| "failed to load binary corpus")?;
+        let corpus_bytes: usize = binary_sequences.iter().map(|seq| seq.len()).sum();
+        info!(
+            "loaded {} filesystem sequences totalling {:.2} MiB",
+            binary_sequences.len(),
+            bytes_to_mebibytes(corpus_bytes)
+        );
+        sequences.append(&mut binary_sequences);
+    }
+
+    if !args.jsonl_inputs.is_empty() {
+        let mut jsonl_sequences =
+            load_jsonl_corpus(&args.jsonl_inputs).with_context(|| "failed to load JSONL corpus")?;
+        let jsonl_bytes: usize = jsonl_sequences.iter().map(|seq| seq.len()).sum();
+        info!(
+            "loaded {} sequences from {} JSONL file(s) totalling {:.2} MiB",
+            jsonl_sequences.len(),
+            args.jsonl_inputs.len(),
+            bytes_to_mebibytes(jsonl_bytes)
+        );
+        sequences.append(&mut jsonl_sequences);
+    }
+
+    if sequences.is_empty() {
+        return Err(anyhow!(
+            "no training data loaded; check file paths or JSONL specifications"
+        ));
+    }
+
     let corpus_bytes: usize = sequences.iter().map(|seq| seq.len()).sum();
     info!(
-        "loaded {} sequences totalling {:.2} MiB",
+        "combined corpus: {} sequences ({:.2} MiB)",
         sequences.len(),
         bytes_to_mebibytes(corpus_bytes)
     );
@@ -1012,6 +1146,14 @@ fn run_train(args: TrainArgs) -> Result<()> {
             .with_context(|| format!("failed to pretty print {}", args.output.display()))?;
     }
 
+    emit_family_models(
+        &artifacts.model,
+        &args.family_sizes,
+        args.family_template.as_deref(),
+        &args.output,
+        args.pretty,
+    )?;
+
     info!(
         "training complete: merges={merges} vocab={vocab_size} duration={elapsed:.2?} throughput={throughput:.2} MiB/s"
     );
@@ -1066,6 +1208,10 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         cfg = cfg.special_tokens(args.special_tokens.clone());
     }
     cfg = cfg
+        .preprocessor(
+            args.preprocessor
+                .into_config(args.preprocessor_probability, args.preprocessor_seed),
+        )
         .max_merge_iterations(args.max_merge_iterations)
         .show_progress(false)
         .plateau_stop_enabled(false);
@@ -1496,6 +1642,14 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
             )
         })?;
 
+    emit_family_models(
+        &final_model,
+        &args.family_sizes,
+        args.family_template.as_deref(),
+        &args.output,
+        false,
+    )?;
+
     let combined_chunks = snapshots.len();
 
     if args.no_report {
@@ -1730,6 +1884,118 @@ fn run_info(args: InfoArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn emit_family_models(
+    model: &BpeModel,
+    family_sizes: &[usize],
+    template: Option<&str>,
+    base_output: &Path,
+    pretty: bool,
+) -> Result<()> {
+    if family_sizes.is_empty() {
+        return Ok(());
+    }
+    let mut requested = family_sizes.to_vec();
+    requested.sort_unstable();
+    requested.dedup();
+    if requested.is_empty() {
+        return Ok(());
+    }
+
+    let mut derived_paths = Vec::new();
+    for size in requested {
+        let derived = model
+            .derive_with_vocab(size)
+            .with_context(|| format!("failed to derive vocabulary of size {size}"))?;
+        let output_path = resolve_family_output_path(base_output, template, size);
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to create family output directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+        }
+        derived.save_huggingface(&output_path).with_context(|| {
+            format!(
+                "failed to save derived tokenizer for vocab {size} to {}",
+                output_path.display()
+            )
+        })?;
+        if pretty {
+            let pretty_json = derived.to_huggingface_json(true)?;
+            fs::write(&output_path, pretty_json).with_context(|| {
+                format!(
+                    "failed to pretty print derived tokenizer {}",
+                    output_path.display()
+                )
+            })?;
+        }
+        derived_paths.push((size, output_path));
+    }
+
+    if !derived_paths.is_empty() {
+        println!("📚 derived tokenizer family members:");
+        for (size, path) in derived_paths {
+            println!("   vocab {size} -> {}", path.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_family_output_path(base: &Path, template: Option<&str>, size: usize) -> PathBuf {
+    if let Some(pattern) = template {
+        let rendered = pattern.replace("{size}", &size.to_string());
+        let candidate = PathBuf::from(rendered);
+        if candidate.is_relative() {
+            let parent = base
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            if parent.as_os_str().is_empty() || parent == Path::new(".") {
+                candidate
+            } else {
+                parent.join(candidate)
+            }
+        } else {
+            candidate
+        }
+    } else {
+        default_family_output_path(base, size)
+    }
+}
+
+fn default_family_output_path(base: &Path, size: usize) -> PathBuf {
+    let parent = base
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "tokenizer".to_string());
+    let extension = base
+        .extension()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("json");
+    let filename = if extension.is_empty() {
+        format!("{stem}-{size}")
+    } else {
+        format!("{stem}-{size}.{}", extension)
+    };
+    if parent.as_os_str().is_empty() || parent == Path::new(".") {
+        PathBuf::from(filename)
+    } else {
+        parent.join(filename)
+    }
 }
 
 #[must_use]

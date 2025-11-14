@@ -5,6 +5,53 @@ use std::convert::TryFrom;
 use crate::error::{BbpeError, Result};
 use serde::{Deserialize, Serialize};
 
+/// Preprocessing mode applied before BPE training.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PreprocessorConfig {
+    /// Which splitter to apply ahead of training.
+    pub kind: PreprocessorKind,
+    /// Probability that a detected delimiter boundary is preserved (1.0 = always split).
+    pub split_probability: f64,
+    /// Optional RNG seed for deterministic probabilistic preprocessing.
+    pub seed: Option<u64>,
+}
+
+impl Default for PreprocessorConfig {
+    fn default() -> Self {
+        Self {
+            kind: PreprocessorKind::None,
+            split_probability: 1.0,
+            seed: None,
+        }
+    }
+}
+
+impl PreprocessorConfig {
+    /// Validates probability bounds and returns an error when misconfigured.
+    pub fn validate(&self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.split_probability) {
+            return Err(BbpeError::InvalidConfig(format!(
+                "preprocessor split probability ({}) must be between 0.0 and 1.0",
+                self.split_probability
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Supported preprocessing strategies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PreprocessorKind {
+    /// Disable preprocessing, operating directly on raw byte streams.
+    None,
+    /// Split on contiguous ASCII whitespace runs (space, tab, CR/LF, vertical tab, form feed).
+    AsciiWhitespace,
+    /// Split on Unicode whitespace using [`char::is_whitespace`].
+    UnicodeWhitespace,
+    /// Split binary sequences on runs of `0x00` bytes.
+    NullDelimited,
+}
+
 /// Configuration for binary BPE training.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TrainerConfig {
@@ -28,6 +75,8 @@ pub struct TrainerConfig {
     pub max_merge_iterations: Option<usize>,
     /// Enables plateau-based early stopping with `plateau_patience`.
     pub plateau_stop_enabled: bool,
+    /// Optional preprocessing performed before counting merges.
+    pub preprocessor: PreprocessorConfig,
 }
 
 impl TrainerConfig {
@@ -39,6 +88,7 @@ impl TrainerConfig {
 
     /// Validates the invariants required for training.
     pub fn validate(&self) -> Result<()> {
+        self.preprocessor.validate()?;
         if self.target_vocab_size < 256 + self.special_tokens.len() {
             return Err(BbpeError::InvalidConfig(format!(
                 "target_vocab_size ({}) must be at least 256 + special tokens ({}).",
@@ -103,6 +153,7 @@ impl Default for TrainerConfig {
             plateau_frequency_divisor: 512,
             max_merge_iterations: None,
             plateau_stop_enabled: false,
+            preprocessor: PreprocessorConfig::default(),
         }
     }
 }
@@ -182,6 +233,27 @@ impl TrainerBuilder {
     #[must_use]
     pub fn max_merge_iterations(mut self, value: Option<usize>) -> Self {
         self.cfg.max_merge_iterations = value;
+        self
+    }
+
+    /// Configures the preprocessing mode applied before training.
+    #[must_use]
+    pub fn preprocessor(mut self, config: PreprocessorConfig) -> Self {
+        self.cfg.preprocessor = config;
+        self
+    }
+
+    /// Overrides only the preprocessor split probability.
+    #[must_use]
+    pub fn preprocessor_split_probability(mut self, probability: f64) -> Self {
+        self.cfg.preprocessor.split_probability = probability;
+        self
+    }
+
+    /// Sets an optional RNG seed for probabilistic preprocessing.
+    #[must_use]
+    pub fn preprocessor_seed(mut self, seed: Option<u64>) -> Self {
+        self.cfg.preprocessor.seed = seed;
         self
     }
 

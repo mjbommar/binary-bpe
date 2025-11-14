@@ -1,259 +1,228 @@
 # bbpe
 
-Binary byte pair encoding (BPE) tokenizer for Rust. Generates production-ready `tokenizer.json` files compatible with [Hugging Face tokenizers](https://github.com/huggingface/tokenizers/).
+Binary-aware byte pair encoding (BPE) toolkit for Rust. `bbpe` trains Hugging Face–compatible `tokenizer.json` assets directly from raw binaries or newline-delimited JSON (JSONL) text, making it easy to build tokenizers for firmware, malware, structured data dumps, or hybrid corpora.
+
+- **Binary-first**: Streams arbitrary bytes, honors null-delimited boundaries, and always exports true byte fallback Hugging Face models.
+- **Configurable preprocessing**: Deterministic ASCII/Unicode/null splitters or probabilistic boundary sampling to encourage multi-word merges.
+- **JSONL ingestion**: Point at `file.jsonl[:field.path]` (gzip optional) to train on textual corpora without pre-extracting files.
+- **Hierarchical vocabularies**: Train once at a large vocab, derive smaller siblings whose token IDs remain aligned.
+- **Chunked training**: Experimental `chunk-train` command allows ensemble-style training on arbitrarily large corpora.
 
 ## Installation
 
 ```bash
-# Install CLI and library
+# CLI + library
 cargo install bbpe
 
-# Library only
-cargo add bbpe
+# Add as a dependency (library only)
+cargo add bbpe@0.5.0
 ```
 
-For library-only usage without CLI:
+For library-only usage without the CLI feature:
+
 ```toml
-bbpe = { version = "0.2", default-features = false }
+bbpe = { version = "0.5", default-features = false }
 ```
 
 ## Quick Start
 
-Train a tokenizer on binary files and use it:
+### Train on binaries
 
 ```bash
-# Train tokenizer (270MB ISO takes ~3 minutes, achieves 1.46 MiB/s)
-bbpe train /tmp/alpine-standard-3.22.2-x86_64.iso --vocab-size 8192 -o tokenizer.json
-
-# Encode binary to tokens
-bbpe encode -m tokenizer.json binary.file --json
-{"path":"binary.file","tokens":[6299,144,144,144,6299,6335,213,4238]}
-
-# Decode tokens back to bytes
-bbpe decode -m tokenizer.json --output decoded.bin 6299 144 144 144
-
-# Inspect tokenizer
-bbpe info -m tokenizer.json
-Model type   : BPE
-Vocab size   : 8185
-Merges       : 7929
-Byte fallback: true
-Special tokens: <|start|>, <|end|>, <|pad|>, <|unk|>, <|cls|>, <|sep|>, <|mask|>
+bbpe train firmware.bin --vocab-size 4096 --min-frequency 4 \
+  --preprocessor null-delimited -o tokenizer.json
 ```
 
-## Library Usage
-
-```rust
-use bbpe::{Trainer, TrainerConfig, IngestConfig};
-
-// Configure and train
-let cfg = TrainerConfig::builder()
-    .target_vocab_size(4096)
-    .min_frequency(2)
-    .build()?;
-
-let trainer = Trainer::new(cfg);
-let artifacts = trainer.train_from_paths(
-    &["/path/to/binaries"],
-    &IngestConfig::default()
-)?;
-
-// Save tokenizer
-artifacts.model.save_huggingface("tokenizer.json")?;
-
-// Use for encoding/decoding
-let tokenizer = artifacts.model.binary_tokenizer()?;
-let tokens = tokenizer.encode_bytes(b"\x7fELF\x02\x01", false)?;
-let decoded = tokenizer.decode_to_bytes(&tokens, true)?;
-assert_eq!(decoded, b"\x7fELF\x02\x01");
-```
-
-## CLI Commands
-
-### train
-Build a tokenizer from binary inputs.
+### Train on JSONL text (gzip supported)
 
 ```bash
-bbpe train <INPUT_PATH> [OPTIONS]
-
-Options:
-  --vocab-size <SIZE>       Target vocabulary size [default: 32768]
-  --min-frequency <FREQ>    Minimum pair frequency [default: 4]
-  --chunk-size <BYTES>      File chunk size [default: 8192]
-  -o, --output <PATH>       Output tokenizer path [default: tokenizer.json]
-  --no-progress             Disable progress bar
-  --threads <NUM>           Thread pool size
+bbpe train \
+  --jsonl corpus.jsonl:text \
+  --jsonl docs.jsonl.gz:data.body \
+  --vocab-size 8192 --min-frequency 2 \
+  --preprocessor ascii-whitespace \
+  --preprocessor-probability 0.75 \
+  --preprocessor-seed 42 \
+  --family-size 4096 --family-size 2048 \
+  --family-template out/tokenizer-{size}.json \
+  -o tokenizer-8192.json
 ```
 
-Example with 1GB corpus:
-```bash
-bbpe train ./corpus --vocab-size 16384 --min-frequency 128 -o large.json
-```
-
-### chunk-train *(experimental)*
-Train independent tokenizers on fixed-size chunks, capture their intermediate merges, and combine the per-chunk vocabularies using a selectable strategy. This workflow keeps peak memory predictable while letting you experiment with ensemble-style reducers.
+### Encode / Decode
 
 ```bash
-bbpe chunk-train <INPUT_PATH>... [OPTIONS]
-
-Key options:
-  --chunk-size <BYTES>     Target chunk size (default: 32 MiB)
-  --vocab-size <SIZE>      Target vocabulary size per chunk
-  --min-frequency <FREQ>   Minimum pair frequency per chunk
-  --combine-mode <MODE>    Vocabulary combiner: first | frequency | support | entropy (default: support)
-  --duplicates <MODE>      Duplicate chunk handling: count | unique (default: count)
-  --output <PATH>          Combined tokenizer path (default: chunked-tokenizer.json)
-  --report <PATH>          JSON report capturing per-chunk merges (default: chunk_train_report.json)
-  --no-progress            Disable per-chunk progress reporting
-```
-
-Example:
-
-```bash
-bbpe chunk-train ./corpus \
-  --chunk-size $((8 * 1024 * 1024)) \
-  --vocab-size 4096 \
-  --combine-mode entropy \
-  --output chunked.json \
-  --report chunked_report.json
-```
-
-The generated report records every chunk's merge sequence and metadata so that additional combination techniques can be prototyped without retraining. Chunk training now emits a lightweight progress bar as it works through the corpus; pass `--no-progress` if you prefer the previous quiet mode (logging still reports a per-chunk summary either way).
-
-Identical chunk contents are hashed and cached so repeated binaries no longer trigger redundant retraining. Use `--duplicates count` (default) to keep counting each duplicate when combining vocabularies, or switch to `--duplicates unique` to collapse identical chunks down to a single representative.
-
-#### Combination modes
-
-- `first` – reuse the vocabulary from the first chunk verbatim.
-- `frequency` – aggregate merges by their summed per-chunk frequency.
-- `support` – favour merges that appear consistently across chunks (default, recommended baseline).
-- `entropy` – frequency weighting with entropy-based chunk weights (useful for heterogeneous corpora).
-
-#### Performance snapshot
-
-The chunked pipeline is designed to be competitive with the full trainer while slashing peak RAM:
-
-| corpus & vocab | mode | chunk size | peak RSS | wall time | bytes/token |
-| --- | --- | --- | --- | --- | --- |
-| sample-001.txt (1.38 GiB), vocab 4 096 | full train | — | ~6.9 GiB | 16 m 24 s | 4.39 |
-| sample-001.txt (1.38 GiB), vocab 4 096 | support | 4 MiB | **~1.4 GiB** | 16 m 04 s | **3.71** |
-| sample-002.txt (21.7 MiB), vocab 16 384 | full train | — | 0.20 GiB | 45 s | 6.22 |
-| sample-002.txt (21.7 MiB), vocab 16 384 | support | 4 MiB | **0.09 GiB** | 43 s | **4.73** |
-
-Support-mode chunking consistently realises the full merge budget, keeps throughput on par with the monolithic trainer, and produces more composable subword tokens.
-
-#### Inspecting token differences
-
-The helper script `scripts/compare_tokenizations.py` makes it easy to compare vocabularies:
-
-```bash
-uv run --with tokenizers python scripts/compare_tokenizations.py \
-  --text ~/sample-001.txt \
-  --bytes 256 \
-  --model full:/tmp/sample001-full.json \
-  --model support-4m:/tmp/sample001-support-4m.json
-```
-
-The script prints the raw excerpt and the token sequence for each model so you can eyeball how the chunk combiners differ from the full trainer.
-
-### encode
-Convert binary files to token sequences.
-
-```bash
-bbpe encode -m <TOKENIZER> <FILES>... [OPTIONS]
-
-Options:
-  --json                    Output JSON format
-  --output <PATH>           Save tokens to file
-  --skip-special-tokens     Skip special tokens
-```
-
-Examples:
-```bash
-# JSON output
-bbpe encode -m tokenizer.json binary.exe --json
-
-# Save to file
-bbpe encode -m tokenizer.json data.bin --output data.tokens
-```
-
-### decode
-Reconstruct bytes from token IDs.
-
-```bash
-bbpe decode -m <TOKENIZER> [IDS]... [OPTIONS]
-
-Options:
-  --input <PATH>            Read tokens from file
-  --output <PATH>           Save decoded bytes (default: stdout)
-  --skip-special-tokens     Skip special tokens
-```
-
-Examples:
-```bash
-# Decode from arguments
-bbpe decode -m tokenizer.json 6299 144 144 --output restored.bin
-
-# Decode from file
+bbpe encode -m tokenizer.json binary.bin --json > tokens.json
 bbpe decode -m tokenizer.json --input tokens.txt --output restored.bin
 ```
 
-### info
-Display tokenizer metadata.
+## CLI Reference
+
+Every command accepts `-q/--quiet` and `-v/--verbose` for logging control. Paths can be repeated.
+
+### `train`
+
+Build a tokenizer from binary files, directories, and/or JSONL specs.
+
+```
+bbpe train [FILES]... [--jsonl PATH:FIELD]... [OPTIONS]
+```
+
+Key options:
+
+| Flag | Description |
+| --- | --- |
+| `--jsonl PATH:FIELD` | Train from newline-delimited JSON. `FIELD` uses `dot.separated.keys`. Files ending in `.gz` are transparently decompressed. Repeatable. |
+| `-o, --output PATH` | Output `tokenizer.json` (default `tokenizer.json`). |
+| `--vocab-size SIZE` | Target vocabulary (default 32768). Must be ≥ 256 + special tokens. |
+| `--min-frequency COUNT` | Minimum pair frequency for merges (default 4). |
+| `--chunk-size BYTES` | Read binary inputs in chunks (default 8192, `0` = whole file). |
+| `--special-token TOKEN` | Append custom special tokens (repeatable). |
+| `--preprocessor MODE` | `none`, `ascii-whitespace`, `unicode-whitespace`, or `null-delimited`. |
+| `--preprocessor-probability P` | Probability `[0,1]` that each detected boundary is kept (default `1.0`). Set `< 1` to occasionally merge across whitespace/null runs. |
+| `--preprocessor-seed SEED` | Seed RNG for probabilistic preprocessing. |
+| `--family-size SIZE` | Emit derived vocabularies after training (repeat flag). |
+| `--family-template PATTERN` | Output template for derived models (supports `{size}`). |
+| `--max-merge-iterations COUNT` | Hard merge ceiling (defaults to vocab budget). |
+| `--allowed-length LEN` | Restrict merge lengths (repeat). |
+| `--threads N` | Override Rayon worker count. |
+| `--no-progress` | Disable spinner output (logging still shows start/end). |
+| `--min-entropy BITS`, `--max-entropy BITS` | Filter sequences outside entropy window before training. |
+
+### `chunk-train` (experimental)
+
+Train chunk-wise vocabularies and combine them. Useful when full-corpus training would exceed memory.
+
+```
+bbpe chunk-train [FILES]... [OPTIONS]
+```
+
+Notable flags:
+
+- `--chunk-size BYTES` (required, default 32 MiB)
+- `--combine-mode first|frequency|support|entropy`
+- `--duplicates count|unique`
+- `--output PATH`, `--report PATH`, `--no-report`
+- Same preprocessing / probability knobs as `train`. (Currently, JSONL ingestion is only available on the main `train` command.)
+
+### `encode`
+
+```
+bbpe encode -m tokenizer.json <FILES>... [--json] [--output PATH] [--skip-special-tokens]
+```
+
+### `decode`
+
+```
+bbpe decode -m tokenizer.json [IDS]... [--input PATH] [--output PATH] [--skip-special-tokens]
+```
+
+### `info`
+
+```
+bbpe info -m tokenizer.json [--json]
+```
+
+## Preprocessing Modes
+
+`bbpe` optionally splits inputs before merge counting:
+
+- **ascii-whitespace** – Splits on ASCII whitespace (`space`, `\t`, `\r`, `\n`, `VT`, `FF`).
+- **unicode-whitespace** – Uses `char::is_whitespace`, preserving Unicode separators (implemented with `bstr`).
+- **null-delimited** – Splits on contiguous `0x00` runs (great for binaries with C strings or padded records).
+- **none** – Raw byte stream.
+
+Set `--preprocessor-probability <P>` (or `TrainerConfig::builder().preprocessor_split_probability(P)`) to randomly *keep* only a subset of boundaries. Example: `P=0.8` keeps 80 % of whitespace splits while letting 20 % of tokens cross word boundaries, encouraging the model to learn multi-word merges. Provide `--preprocessor-seed` for reproducibility. Hugging Face exports automatically drop the pre-tokenizer section when `P < 1.0`, so downstream inference sees the exact byte stream used during training.
+
+## JSONL Ingestion
+
+Use `--jsonl path.jsonl:field.path` to read newline-delimited JSON alongside binary files. Examples:
+
+- `--jsonl data.jsonl:text`
+- `--jsonl downloads/articles.jsonl.gz:payload.body`
+
+Field paths use dot notation; numeric array indices are allowed (`choices.0.text`). Empty lines are skipped, non-string fields error out. The reader accepts gzip-compressed inputs (`.jsonl.gz`).
+
+Library equivalent:
+
+```rust
+use bbpe::{Trainer, TrainerConfig, TrainerArtifacts};
+use bbpe::corpus::JsonlSpec;
+
+let cfg = TrainerConfig::builder()
+    .target_vocab_size(8192)
+    .min_frequency(2)
+    .preprocessor_split_probability(0.7)
+    .preprocessor_seed(Some(1337))
+    .build()?;
+let trainer = Trainer::new(cfg);
+let specs = ["corpus.jsonl:text".parse::<JsonlSpec>()?];
+let TrainerArtifacts { model, .. } = trainer.train_from_jsonl(&specs)?;
+model.save_huggingface("tokenizer.json")?;
+```
+
+## Hierarchical Tokenizer Families
+
+After training the largest vocab, derive smaller siblings whose token IDs stay aligned:
 
 ```bash
-bbpe info -m <TOKENIZER> [--json]
+bbpe train corpus.bin --vocab-size 32768 \
+  --family-size 8192 --family-size 4096 \
+  --family-template artifacts/model-{size}.json \
+  -o artifacts/model-32768.json
 ```
 
-## Configuration
+`BpeModel::derive_with_vocab(size)` mirrors the CLI for library users. Special tokens remain clustered at the end so IDs stay consistent across the family.
 
-### TrainerConfig
+## Chunk Training (experimental)
+
+`bbpe chunk-train` slices the corpus into fixed-size windows, trains independent vocabularies, and merges them via user-selectable strategies (`support`, `frequency`, etc.). Duplicate chunk caching, entropy filtering, and reporting are built in so you can prototype large corpora without huge memory spikes.
+
+## Library Primer
 
 ```rust
-TrainerConfig::builder()
-    .target_vocab_size(8192)        // Target vocabulary size
-    .min_frequency(2)                // Minimum pair frequency for merging
-    .allowed_token_lengths(1..=16)   // Token length range
-    .special_tokens(vec![...])      // Special tokens to add
-    .show_progress(true)             // Display progress bar
-    .build()
+use bbpe::{Trainer, TrainerConfig, IngestConfig, PreprocessorConfig, PreprocessorKind};
+
+let trainer_cfg = TrainerConfig::builder()
+    .target_vocab_size(4096)
+    .min_frequency(2)
+    .preprocessor(PreprocessorConfig {
+        kind: PreprocessorKind::UnicodeWhitespace,
+        split_probability: 0.9,
+        seed: Some(42),
+    })
+    .build()?;
+let trainer = Trainer::new(trainer_cfg);
+let ingest_cfg = IngestConfig::builder().chunk_size(0).build();
+let artifacts = trainer.train_from_paths(&["firmware.bin"], &ingest_cfg)?;
+artifacts.model.save_huggingface("tokenizer.json")?;
+
+// Hierarchy
+let small = artifacts.model.derive_with_vocab(2048)?;
+small.save_huggingface("tokenizer-2048.json")?;
 ```
 
-### IngestConfig
-
-```rust
-IngestConfig::builder()
-    .chunk_size(8192)       // File reading chunk size
-    .recursive(true)        // Traverse directories recursively
-    .follow_symlinks(false) // Follow symbolic links
-    .build()
-```
+`Trainer::train_from_jsonl(&[JsonlSpec])` mirrors the CLI `--jsonl` behavior.
 
 ## Python Interoperability
 
-Generated tokenizers work directly with Hugging Face:
+All tokenizers are Hugging Face JSON artifacts:
 
 ```python
 from tokenizers import Tokenizer
 
-tokenizer = Tokenizer.from_file("tokenizer.json")
-encoded = tokenizer.encode(binary_data)
-print(encoded.ids)  # [6299, 144, 144, ...]
+model = Tokenizer.from_file("tokenizer.json")
+encoding = model.encode("\x7fELF", add_special_tokens=False)
+print(encoding.ids)
 ```
 
-## Performance
-
-- Training: >1 MiB/s on release builds
-- Parallel processing with Rayon
-- Incremental pair counting for efficient merging
-- Tested on 270MB files with sub-4-minute training time
-
-## Development
+## Development & Testing
 
 ```bash
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+# Optional sanity check before publishing
+cargo package
 ```
 
 ## License

@@ -49,10 +49,13 @@ pub mod corpus;
 pub mod error;
 pub mod metrics;
 pub mod model;
+pub mod preprocess;
 pub mod serialization;
 pub mod trainer;
 
-pub use config::{IngestConfig, TrainerBuilder, TrainerConfig};
+pub use config::{
+    IngestConfig, PreprocessorConfig, PreprocessorKind, TrainerBuilder, TrainerConfig,
+};
 pub use error::{BbpeError, Result};
 pub use metrics::{IterationMetrics, TrainingMetrics};
 pub use model::{BinaryTokenizer, BpeModel, TokenId};

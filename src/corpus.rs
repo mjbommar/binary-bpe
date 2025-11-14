@@ -1,13 +1,57 @@
 //! Facilities for discovering input files and loading binary corpora.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
+use flate2::read::MultiGzDecoder;
+use serde_json::Value;
 use walkdir::WalkDir;
 
 use crate::config::IngestConfig;
 use crate::error::{BbpeError, Result};
+
+/// Specification describing a JSONL input file and the nested field to extract per record.
+#[derive(Debug, Clone)]
+pub struct JsonlSpec {
+    /// Path to the JSONL file.
+    pub path: PathBuf,
+    /// Nested field path (e.g. `["choices", "0", "text"]`).
+    pub field_path: Vec<String>,
+}
+
+impl std::str::FromStr for JsonlSpec {
+    type Err = String;
+
+    fn from_str(spec: &str) -> std::result::Result<Self, Self::Err> {
+        let mut parts = spec.rsplitn(2, ':');
+        let field = parts
+            .next()
+            .ok_or_else(|| "jsonl specification must include `PATH:FIELD`".to_string())?;
+        let path = parts
+            .next()
+            .ok_or_else(|| "jsonl specification missing file path".to_string())?;
+        if path.is_empty() {
+            return Err("jsonl file path cannot be empty".into());
+        }
+        if field.is_empty() {
+            return Err("jsonl field path cannot be empty".into());
+        }
+        let field_path: Vec<String> = field
+            .split('.')
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| segment.to_string())
+            .collect();
+        if field_path.is_empty() {
+            return Err("jsonl field path must contain at least one segment".into());
+        }
+        Ok(Self {
+            path: PathBuf::from(path),
+            field_path,
+        })
+    }
+}
 
 /// Lazily streams binary corpus chunks from disk without retaining them all in memory.
 pub struct BinaryChunkStream {
@@ -111,6 +155,77 @@ pub fn load_binary_corpus<P: AsRef<Path>>(
         ));
     }
     Ok(sequences)
+}
+
+/// Loads newline-delimited JSON (JSONL) records and extracts byte sequences from a specified field.
+pub fn load_jsonl_corpus(specs: &[JsonlSpec]) -> Result<Vec<Vec<u8>>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut sequences = Vec::new();
+    for spec in specs {
+        let reader = open_jsonl_reader(&spec.path)?;
+        for (line_idx, line) in reader.lines().enumerate() {
+            let line = line.map_err(|err| BbpeError::io(err, Some(spec.path.clone())))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).map_err(|err| {
+                BbpeError::InvalidConfig(format!(
+                    "failed to parse JSON in {} on line {}: {err}",
+                    spec.path.display(),
+                    line_idx + 1
+                ))
+            })?;
+            let mut current = &value;
+            for key in &spec.field_path {
+                current = current.get(key).ok_or_else(|| {
+                    BbpeError::InvalidConfig(format!(
+                        "field `{}` missing in {} on line {}",
+                        spec.field_path.join("."),
+                        spec.path.display(),
+                        line_idx + 1
+                    ))
+                })?;
+            }
+            let text = current.as_str().ok_or_else(|| {
+                BbpeError::InvalidConfig(format!(
+                    "field `{}` in {} line {} is not a string",
+                    spec.field_path.join("."),
+                    spec.path.display(),
+                    line_idx + 1
+                ))
+            })?;
+            if !text.is_empty() {
+                sequences.push(text.as_bytes().to_vec());
+            }
+        }
+    }
+
+    if sequences.is_empty() {
+        return Err(BbpeError::InvalidConfig(
+            "no sequences extracted from JSONL inputs".into(),
+        ));
+    }
+    Ok(sequences)
+}
+
+fn open_jsonl_reader(path: &Path) -> Result<Box<dyn BufRead>> {
+    let file = File::open(path).map_err(|err| BbpeError::io(err, Some(path.to_path_buf())))?;
+    if is_gzip_path(path) {
+        let decoder = MultiGzDecoder::new(file);
+        Ok(Box::new(BufReader::new(decoder)))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+fn is_gzip_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("gz"))
+        .unwrap_or(false)
 }
 
 /// Streams binary corpus chunks from disk, avoiding materialising the entire corpus at once.

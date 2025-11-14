@@ -5,12 +5,15 @@ use std::path::Path;
 use ahash::AHashMap;
 use tokenizers::decoders::{fuse::Fuse, DecoderWrapper};
 use tokenizers::models::bpe::BPE;
-use tokenizers::pre_tokenizers::PreTokenizerWrapper;
-use tokenizers::tokenizer::AddedToken;
+use tokenizers::pre_tokenizers::{
+    split::{Split as SplitPreTokenizer, SplitPattern},
+    PreTokenizerWrapper,
+};
+use tokenizers::tokenizer::{AddedToken, SplitDelimiterBehavior};
 use tokenizers::Tokenizer;
 
 use crate::bytes::{bytes_to_latin1, latin1_to_bytes};
-use crate::config::TrainerConfig;
+use crate::config::{PreprocessorConfig, PreprocessorKind, TrainerConfig};
 use crate::error::{BbpeError, Result};
 use crate::serialization::{save_huggingface_tokenizer, tokenizer_json};
 
@@ -105,7 +108,11 @@ impl BpeModel {
             .map_err(|err| BbpeError::Tokenizers(err.to_string()))?;
         let mut tokenizer = Tokenizer::new(builder);
 
-        tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
+        if let Some(pre_tokenizer) = build_pre_tokenizer(&self.config.preprocessor)? {
+            tokenizer.with_pre_tokenizer(Some(pre_tokenizer));
+        } else {
+            tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
+        }
         tokenizer.with_decoder(Some(DecoderWrapper::Fuse(Fuse::new())));
 
         if !self.special_tokens.is_empty() {
@@ -133,6 +140,41 @@ impl BpeModel {
     /// Builds a [`BinaryTokenizer`] helper wrapping the Hugging Face tokenizer.
     pub fn binary_tokenizer(&self) -> Result<BinaryTokenizer> {
         BinaryTokenizer::from_model(self)
+    }
+
+    /// Creates a derived model trimmed to the requested vocabulary size while preserving merge order.
+    pub fn derive_with_vocab(&self, target_vocab_size: usize) -> Result<Self> {
+        let special_count = self.special_tokens.len();
+        let min_vocab = 256 + special_count;
+        if target_vocab_size < min_vocab {
+            return Err(BbpeError::InvalidConfig(format!(
+                "requested family vocab {target_vocab_size} is smaller than required minimum {min_vocab}"
+            )));
+        }
+        let current_total = self.vocab_size();
+        if target_vocab_size > current_total {
+            return Err(BbpeError::InvalidConfig(format!(
+                "requested family vocab {target_vocab_size} exceeds trained size {current_total}"
+            )));
+        }
+
+        let target_base = target_vocab_size - special_count;
+        if target_base > self.token_bytes.len() {
+            return Err(BbpeError::Internal(
+                "computed base vocabulary exceeds stored tokens".into(),
+            ));
+        }
+        let target_merges = target_base.saturating_sub(256);
+        let token_bytes = self.token_bytes[..target_base].to_vec();
+        let merges = self.merges[..target_merges].to_vec();
+
+        let mut config = self.config.clone();
+        config.target_vocab_size = target_vocab_size;
+        if let Some(limit) = config.max_merge_iterations {
+            config.max_merge_iterations = Some(limit.min(target_merges));
+        }
+
+        Ok(BpeModel::new(token_bytes, merges, config))
     }
 }
 
@@ -199,10 +241,52 @@ impl BinaryTokenizer {
     }
 }
 
+const ASCII_WHITESPACE_REGEX: &str = r"[ \t\n\r\x0B\x0C]+";
+const UNICODE_WHITESPACE_REGEX: &str = r"[\x{0009}\x{000A}\x{000B}\x{000C}\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}\x{2001}\x{2002}\x{2003}\x{2004}\x{2005}\x{2006}\x{2007}\x{2008}\x{2009}\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]+";
+const NULL_DELIMITED_REGEX: &str = r"\x00+";
+
+fn build_pre_tokenizer(config: &PreprocessorConfig) -> Result<Option<PreTokenizerWrapper>> {
+    if config.split_probability < 1.0 {
+        return Ok(None);
+    }
+    let behavior = SplitDelimiterBehavior::Isolated;
+    let make_split = |pattern: &str| -> Result<PreTokenizerWrapper> {
+        let split = SplitPreTokenizer::new(SplitPattern::Regex(pattern.into()), behavior, false)
+            .map_err(|err| BbpeError::Tokenizers(err.to_string()))?;
+        Ok(PreTokenizerWrapper::Split(split))
+    };
+
+    let wrapper = match config.kind {
+        PreprocessorKind::None => return Ok(None),
+        PreprocessorKind::AsciiWhitespace => make_split(ASCII_WHITESPACE_REGEX)?,
+        PreprocessorKind::UnicodeWhitespace => make_split(UNICODE_WHITESPACE_REGEX)?,
+        PreprocessorKind::NullDelimited => make_split(NULL_DELIMITED_REGEX)?,
+    };
+
+    Ok(Some(wrapper))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    fn sample_model(vocab: usize, special_tokens: Vec<String>) -> BpeModel {
+        let mut token_bytes = Vec::new();
+        for idx in 0..vocab {
+            token_bytes.push(vec![(idx % 256) as u8]);
+        }
+        let merges = (0..(vocab.saturating_sub(256)))
+            .map(|i| (i as TokenId, (i + 1) as TokenId))
+            .collect::<Vec<_>>();
+        let cfg = TrainerConfig::builder()
+            .target_vocab_size(vocab + special_tokens.len())
+            .special_tokens(special_tokens.clone())
+            .show_progress(false)
+            .build()
+            .expect("valid config");
+        BpeModel::new(token_bytes, merges, cfg)
+    }
 
     fn tiny_model() -> BpeModel {
         let mut token_bytes: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
@@ -214,6 +298,22 @@ mod tests {
             ..TrainerConfig::default()
         };
         BpeModel::new(token_bytes, merges, config)
+    }
+
+    #[test]
+    fn derive_with_vocab_trims_merges_and_tokens() {
+        let model = sample_model(300, Vec::new());
+        let derived = model.derive_with_vocab(280).expect("derive");
+        assert_eq!(derived.token_bytes().len(), 280);
+        assert_eq!(derived.merges().len(), 24);
+    }
+
+    #[test]
+    fn derive_with_vocab_preserves_special_tokens() {
+        let model = sample_model(280, vec!["<|start|>".into(), "<|end|>".into()]);
+        let derived = model.derive_with_vocab(262).expect("derive with specials");
+        assert_eq!(derived.special_tokens(), model.special_tokens());
+        assert_eq!(derived.vocab_size(), 262);
     }
 
     #[test]

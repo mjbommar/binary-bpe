@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+- _Nothing yet._
+
+## 0.5.0 - 2025-11-14
+- Added configurable ASCII, Unicode, and null-delimited preprocessing to both the library (`TrainerConfig::preprocessor`) and CLI (`--preprocessor`), wiring the behaviour into exported Hugging Face tokenizers.
+- Introduced probabilistic preprocessing with optional RNG seeding (`--preprocessor-probability`, `--preprocessor-seed`, and the new builder helpers), allowing occasional cross-delimiter merges while keeping inference aligned with the raw byte stream whenever randomness is enabled.
+- `bbpe train` (and `Trainer::train_from_jsonl`) can now ingest newline-delimited JSON by specifying `--jsonl path.jsonl:field.path`, including transparent support for `.jsonl.gz` inputs, enabling text-heavy corpora without pre-extracting files.
+- Added hierarchical tokenizer families via repeated `--family-size` flags (and the new `BpeModel::derive_with_vocab` helper) plus optional `--family-template` output routing.
+- Documented the new workflows (preprocessors, JSONL ingestion, hierarchical families) and expanded the CLI/integration test suites, including round-trip coverage via the Hugging Face `tokenizers` crate.
+
 ## 0.4.1 - 2025-11-12
 - Added `--min-entropy` and `--max-entropy` flags to `bbpe train` command for filtering chunks during regular training.
 - Enhanced test coverage with 5 new integration tests for entropy filtering in train command.
