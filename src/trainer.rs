@@ -60,17 +60,17 @@ impl Trainer {
         ingest: &IngestConfig,
     ) -> Result<TrainerArtifacts> {
         let sequences = load_binary_corpus(inputs, ingest)?;
-        self.train_from_sequences(&sequences)
+        self.train_from_sequences(sequences)
     }
 
     /// Trains a model by extracting string fields from newline-delimited JSON (JSONL) files.
     pub fn train_from_jsonl(&self, specs: &[JsonlSpec]) -> Result<TrainerArtifacts> {
         let sequences = load_jsonl_corpus(specs)?;
-        self.train_from_sequences(&sequences)
+        self.train_from_sequences(sequences)
     }
 
     /// Trains a model from in-memory byte sequences.
-    pub fn train_from_sequences(&self, sequences: &[Vec<u8>]) -> Result<TrainerArtifacts> {
+    pub fn train_from_sequences(&self, sequences: Vec<Vec<u8>>) -> Result<TrainerArtifacts> {
         if sequences.is_empty() {
             return Err(BbpeError::InvalidConfig(
                 "training requires at least one non-empty sequence".into(),
@@ -78,13 +78,7 @@ impl Trainer {
         }
         self.cfg.validate()?;
 
-        let preprocessed = apply_preprocessor(&self.cfg.preprocessor, sequences);
-        let sequences = preprocessed.as_slice();
-        if sequences.is_empty() {
-            return Err(BbpeError::InvalidConfig(
-                 "preprocessing removed all sequences; adjust the preprocessor or provide non-empty spans".into(),
-             ));
-        }
+        let preprocessed = apply_preprocessor(&self.cfg.preprocessor, &sequences);
 
         let base_vocab = 256usize;
         let special_count = self.cfg.special_tokens.len();
@@ -96,10 +90,21 @@ impl Trainer {
         }
 
         let allowed_lengths = self.cfg.allowed_token_lengths.clone();
-        let mut working_sequences: Vec<Vec<TokenId>> = sequences
-            .iter()
-            .map(|seq| seq.iter().map(|&b| TokenId::from(b)).collect())
-            .collect();
+        let mut working_sequences: Vec<Vec<TokenId>> = {
+            let processed = preprocessed.as_slice();
+            if processed.is_empty() {
+                return Err(BbpeError::InvalidConfig(
+                     "preprocessing removed all sequences; adjust the preprocessor or provide non-empty spans".into(),
+                 ));
+            }
+            processed
+                .iter()
+                .map(|seq| seq.iter().map(|&b| TokenId::from(b)).collect())
+                .collect()
+        };
+
+        drop(preprocessed);
+        drop(sequences);
 
         let mut token_bytes: Vec<Vec<u8>> = (0u8..=u8::MAX).map(|b| vec![b]).collect();
         let mut token_lengths: Vec<usize> = vec![1; token_bytes.len()];
@@ -547,7 +552,7 @@ mod tests {
             vec![0x10, 0x20, 0x10, 0x20],
         ];
         let trainer = trainer(2, 270);
-        let artefacts = trainer.train_from_sequences(&sequences).unwrap();
+        let artefacts = trainer.train_from_sequences(sequences).unwrap();
         assert!(!artefacts.model.merges().is_empty());
         assert!(!artefacts.metrics.iterations.is_empty());
     }
@@ -556,7 +561,7 @@ mod tests {
     fn tokenizer_round_trip() {
         let sequences = vec![vec![0xAA, 0xBB, 0xAA, 0xBB], vec![0xAA, 0xBB, 0xCC, 0xDD]];
         let trainer = trainer(2, 264);
-        let artefacts = trainer.train_from_sequences(&sequences).unwrap();
+        let artefacts = trainer.train_from_sequences(sequences).unwrap();
         let bin_tok = BinaryTokenizer::from_model(&artefacts.model).unwrap();
         let encoded = bin_tok
             .encode_bytes(&[0xAA, 0xBB, 0xAA, 0xBB], false)
@@ -569,7 +574,7 @@ mod tests {
     fn tokenizer_saves_huggingface_json() {
         let sequences = vec![vec![0, 1, 2, 3, 4, 5, 6, 7, 8]];
         let trainer = trainer(1, 258);
-        let artefacts = trainer.train_from_sequences(&sequences).unwrap();
+        let artefacts = trainer.train_from_sequences(sequences).unwrap();
         let dir = tempdir().unwrap();
         let path = dir.path().join("tokenizer.json");
         artefacts.model.save_huggingface(&path).unwrap();

@@ -1121,8 +1121,7 @@ fn run_train(args: TrainArgs) -> Result<()> {
 
     let trainer = Arc::new(Trainer::new(trainer_cfg.clone()));
     let start = Instant::now();
-    let artifacts = trainer.train_from_sequences(&sequences)?;
-    drop(sequences);
+    let artifacts = trainer.train_from_sequences(sequences)?;
     if let Some(pb) = spinner {
         pb.finish_with_message("training complete");
     }
@@ -1380,7 +1379,7 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
 
                     let sequences = vec![chunk];
                     let artifacts = trainer
-                        .train_from_sequences(&sequences)
+                        .train_from_sequences(sequences)
                         .with_context(|| format!("failed to train chunk {index}"))?;
                     let TrainerArtifacts { model, metrics } = artifacts;
 

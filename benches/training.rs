@@ -39,8 +39,9 @@ fn bench_training(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     group.bench_function(BenchmarkId::from_parameter("MiB_1"), |b| {
         b.iter(|| {
+            let sequences = sequences.clone();
             let trainer = Trainer::new(cfg.clone());
-            let artefacts = trainer.train_from_sequences(&sequences).expect("training");
+            let artefacts = trainer.train_from_sequences(sequences).expect("training");
             let _ = black_box(artefacts);
         });
     });
