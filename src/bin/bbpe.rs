@@ -926,6 +926,8 @@ struct AddedToken {
     content: String,
     #[serde(default)]
     special: bool,
+    #[serde(default)]
+    id: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -1846,6 +1848,16 @@ fn run_info(args: InfoArgs) -> Result<()> {
         .filter(|token| token.special)
         .map(|token| token.content.clone())
         .collect::<Vec<_>>();
+    let mut special_token_ids = serde_json::Map::new();
+    for token in &parsed.added_tokens {
+        if token.special {
+            let value = match token.id {
+                Some(id) => json!(id),
+                None => serde_json::Value::Null,
+            };
+            special_token_ids.insert(token.content.clone(), value);
+        }
+    }
     let summary = json!({
         "path": args.tokenizer.display().to_string(),
         "model_type": parsed.model.kind,
@@ -1853,6 +1865,7 @@ fn run_info(args: InfoArgs) -> Result<()> {
         "merges": merges,
         "byte_fallback": parsed.model.byte_fallback,
         "special_tokens": special_tokens,
+        "special_token_ids": special_token_ids,
     });
 
     if args.json {
@@ -1988,7 +2001,7 @@ fn default_family_output_path(base: &Path, size: usize) -> PathBuf {
     let filename = if extension.is_empty() {
         format!("{stem}-{size}")
     } else {
-        format!("{stem}-{size}.{}", extension)
+        format!("{stem}-{size}.{extension}")
     };
     if parent.as_os_str().is_empty() || parent == Path::new(".") {
         PathBuf::from(filename)
