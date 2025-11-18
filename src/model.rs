@@ -37,8 +37,6 @@ pub struct BpeModel {
 #[derive(Debug, Clone)]
 pub struct BinaryTokenizer {
     inner: Tokenizer,
-    vocab_bytes: Vec<Vec<u8>>,
-    base_vocab_size: usize,
 }
 
 impl BpeModel {
@@ -181,18 +179,7 @@ impl BpeModel {
 impl BinaryTokenizer {
     /// Wraps an existing Hugging Face [`Tokenizer`], extracting binary vocab bytes.
     pub fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
-        let base_vocab_size = tokenizer.get_vocab(false).len();
-        let mut entries: Vec<(String, TokenId)> = tokenizer.get_vocab(true).into_iter().collect();
-        entries.sort_by_key(|(_, id)| *id);
-        let vocab_bytes = entries
-            .into_iter()
-            .map(|(token, _)| latin1_to_bytes(&token))
-            .collect::<Vec<_>>();
-        Ok(Self {
-            inner: tokenizer,
-            vocab_bytes,
-            base_vocab_size,
-        })
+        Ok(Self { inner: tokenizer })
     }
 
     /// Builds a [`BinaryTokenizer`] from a trained [`BpeModel`].
@@ -222,22 +209,12 @@ impl BinaryTokenizer {
         tokens: &[TokenId],
         skip_special_tokens: bool,
     ) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        for &id in tokens {
-            let idx = id as usize;
-            if idx >= self.vocab_bytes.len() {
-                return Err(BbpeError::Internal(format!(
-                    "token id {} exceeds vocab size {}",
-                    id,
-                    self.vocab_bytes.len()
-                )));
-            }
-            if skip_special_tokens && idx >= self.base_vocab_size {
-                continue;
-            }
-            bytes.extend_from_slice(&self.vocab_bytes[idx]);
-        }
-        Ok(bytes)
+        let ids: Vec<u32> = tokens.to_vec();
+        let text = self
+            .inner
+            .decode(&ids, skip_special_tokens)
+            .map_err(|err| BbpeError::Tokenizers(err.to_string()))?;
+        Ok(latin1_to_bytes(&text))
     }
 }
 
