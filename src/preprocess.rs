@@ -306,7 +306,7 @@ mod tests {
             split_probability: 0.0,
             seed: None,
         };
-        match apply_preprocessor(&cfg, &[seq.clone()]) {
+        match apply_preprocessor(&cfg, std::slice::from_ref(&seq)) {
             PreprocessedSequences::Borrowed(slice) => assert_eq!(slice[0], seq),
             _ => panic!("probability zero should borrow original data"),
         }
