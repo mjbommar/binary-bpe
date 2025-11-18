@@ -3,6 +3,9 @@
 ## Unreleased
 - _Nothing yet._
 
+## 0.5.2 - 2025-11-18
+- Documented special token numbering behavior: special tokens are always assigned the lowest contiguous ID range `[0, N)` where N is the number of special tokens, ensuring consistency across both `train` and `chunk-train` algorithms and compatibility with Hugging Face tokenizers.
+
 ## 0.5.0 - 2025-11-14
 - Added configurable ASCII, Unicode, and null-delimited preprocessing to both the library (`TrainerConfig::preprocessor`) and CLI (`--preprocessor`), wiring the behaviour into exported Hugging Face tokenizers.
 - Introduced probabilistic preprocessing with optional RNG seeding (`--preprocessor-probability`, `--preprocessor-seed`, and the new builder helpers), allowing occasional cross-delimiter merges while keeping inference aligned with the raw byte stream whenever randomness is enabled.

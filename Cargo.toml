@@ -1,6 +1,6 @@
 [package]
 name = "bbpe"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 authors = ["Binary BPE Maintainers <michael.bommarito@gmail.com>"]
 description = "Binary byte pair encoding (BPE) trainer and CLI compatible with Hugging Face tokenizers"

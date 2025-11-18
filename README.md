@@ -15,13 +15,13 @@ Binary-aware byte pair encoding (BPE) toolkit for Rust. `bbpe` trains Hugging Fa
 cargo install bbpe
 
 # Add as a dependency (library only)
-cargo add bbpe@0.5.0
+cargo add bbpe@0.5.2
 ```
 
 For library-only usage without the CLI feature:
 
 ```toml
-bbpe = { version = "0.5", default-features = false }
+bbpe = { version = "0.5.2", default-features = false }
 ```
 
 ## Quick Start
@@ -172,6 +172,22 @@ bbpe train corpus.bin --vocab-size 32768 \
 ```
 
 `BpeModel::derive_with_vocab(size)` mirrors the CLI for library users. Special tokens remain clustered at the end so IDs stay consistent across the family.
+
+## Special Token Numbering
+
+Special tokens (added via `--special-token` or `TrainerConfig::special_tokens`) are always assigned the **lowest contiguous ID range `[0, N)`** where N is the number of special tokens. This normalization happens during serialization to Hugging Face format and applies to both `train` and `chunk-train` algorithms.
+
+For example, with 2 special tokens `<|start|>` and `<|end|>`:
+- Special token IDs: `[0, 1]`
+- Base byte vocabulary: `[2, 257]` (256 bytes)
+- Learned merges: `[258, ...]`
+
+This ensures:
+- Consistent token IDs across derived vocabulary families
+- Compatibility with Hugging Face tokenizers library expectations
+- Deterministic special token numbering regardless of training algorithm
+
+The base 256-byte vocabulary and learned merges never participate in this normalization; only special tokens are renumbered.
 
 ## Chunk Training (experimental)
 
