@@ -161,6 +161,69 @@ fn train_encode_decode_round_trip() {
 }
 
 #[test]
+fn special_tokens_are_assigned_lowest_ids() {
+    let workspace = temp_workspace();
+    let input_path = workspace.path().join("input.bin");
+    let output_path = workspace.path().join("tokenizer.json");
+
+    let data: Vec<u8> = (0..=255).cycle().take(2048).collect();
+    fs::write(&input_path, &data).expect("write input");
+
+    let mut train = Command::cargo_bin("bbpe").expect("binary exists");
+    train.current_dir(workspace.path()).args([
+        "--quiet",
+        "train",
+        input_path.file_name().unwrap().to_str().unwrap(),
+        "--vocab-size",
+        "270",
+        "--min-frequency",
+        "2",
+        "--no-progress",
+        "--chunk-size",
+        "1024",
+        "--special-token",
+        "<|start|>",
+        "--special-token",
+        "<|end|>",
+        "-o",
+        output_path.file_name().unwrap().to_str().unwrap(),
+    ]);
+    run_command(&mut train);
+
+    let json = fs::read_to_string(&output_path).expect("read tokenizer");
+    let parsed: Value = serde_json::from_str(&json).expect("parse tokenizer json");
+
+    let added = parsed["added_tokens"]
+        .as_array()
+        .expect("added_tokens is an array");
+    let specials: Vec<&Value> = added
+        .iter()
+        .filter(|t| t["special"].as_bool().unwrap_or(false))
+        .collect();
+
+    assert!(
+        !specials.is_empty(),
+        "training with --special-token should record special tokens"
+    );
+
+    let ids: Vec<u64> = specials
+        .iter()
+        .map(|t| t["id"].as_u64().expect("special token id is u64"))
+        .collect();
+
+    let min_id = *ids.iter().min().unwrap();
+    let max_id = *ids.iter().max().unwrap();
+    let count = ids.len() as u64;
+
+    assert_eq!(min_id, 0, "special tokens should start at id 0");
+    assert_eq!(
+        max_id,
+        count - 1,
+        "special tokens should occupy a contiguous prefix of ids"
+    );
+}
+
+#[test]
 fn train_from_jsonl_field() {
     let workspace = temp_workspace();
     let jsonl_path = workspace.path().join("records.jsonl");
