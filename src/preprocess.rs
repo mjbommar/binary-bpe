@@ -4,6 +4,7 @@ use bstr::ByteSlice;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::bytes::is_ascii_whitespace;
 use crate::config::{PreprocessorConfig, PreprocessorKind};
 
 /// Borrowed-or-owned wrapper returned by [`apply_preprocessor`].
@@ -62,7 +63,13 @@ fn split_ascii_sequences<R: Rng + ?Sized>(
     probability: f64,
     rng: &mut R,
 ) -> Vec<Vec<u8>> {
-    split_by_predicate(sequences, is_ascii_whitespace, probability, rng)
+    split_by_predicate(
+        sequences,
+        is_ascii_whitespace,
+        probability,
+        rng,
+        SplitBehavior::Whitespace,
+    )
 }
 
 fn split_unicode_sequences<R: Rng + ?Sized>(
@@ -82,7 +89,13 @@ fn split_null_delimited<R: Rng + ?Sized>(
     probability: f64,
     rng: &mut R,
 ) -> Vec<Vec<u8>> {
-    split_by_predicate(sequences, |byte| byte == 0, probability, rng)
+    split_by_predicate(
+        sequences,
+        |byte| byte == 0,
+        probability,
+        rng,
+        SplitBehavior::Generic,
+    )
 }
 
 fn split_by_predicate<R, F>(
@@ -90,6 +103,7 @@ fn split_by_predicate<R, F>(
     predicate: F,
     probability: f64,
     rng: &mut R,
+    behavior: SplitBehavior,
 ) -> Vec<Vec<u8>>
 where
     R: Rng + ?Sized,
@@ -97,13 +111,9 @@ where
 {
     let mut result = Vec::new();
     for seq in sequences {
-        split_runs(seq, predicate, probability, rng, &mut result);
+        split_runs(seq, predicate, probability, rng, behavior, &mut result);
     }
     result
-}
-
-fn is_ascii_whitespace(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
 }
 
 type Segment = (usize, usize, bool);
@@ -113,6 +123,7 @@ fn split_runs<R, F>(
     predicate: F,
     probability: f64,
     rng: &mut R,
+    behavior: SplitBehavior,
     out: &mut Vec<Vec<u8>>,
 ) where
     R: Rng + ?Sized,
@@ -140,7 +151,7 @@ fn split_runs<R, F>(
             }
         }
     }
-    merge_segments(sequence, segments, probability, rng, out);
+    merge_segments(sequence, segments, probability, rng, behavior, out);
 }
 
 fn split_unicode_runs<R: Rng + ?Sized>(
@@ -187,10 +198,33 @@ fn split_unicode_runs<R: Rng + ?Sized>(
         }
     }
 
-    merge_segments(sequence, segments, probability, rng, out);
+    merge_segments(
+        sequence,
+        segments,
+        probability,
+        rng,
+        SplitBehavior::Whitespace,
+        out,
+    );
 }
 
 fn merge_segments<R: Rng + ?Sized>(
+    sequence: &[u8],
+    segments: Vec<Segment>,
+    probability: f64,
+    rng: &mut R,
+    behavior: SplitBehavior,
+    out: &mut Vec<Vec<u8>>,
+) {
+    match behavior {
+        SplitBehavior::Generic => merge_segments_generic(sequence, segments, probability, rng, out),
+        SplitBehavior::Whitespace => {
+            merge_segments_whitespace(sequence, segments, probability, rng, out)
+        }
+    }
+}
+
+fn merge_segments_generic<R: Rng + ?Sized>(
     sequence: &[u8],
     segments: Vec<Segment>,
     probability: f64,
@@ -213,6 +247,84 @@ fn merge_segments<R: Rng + ?Sized>(
     out.push(buffer);
 }
 
+fn merge_segments_whitespace<R: Rng + ?Sized>(
+    sequence: &[u8],
+    segments: Vec<Segment>,
+    probability: f64,
+    rng: &mut R,
+    out: &mut Vec<Vec<u8>>,
+) {
+    if segments.is_empty() {
+        return;
+    }
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut pending_whitespace: Option<Vec<u8>> = None;
+    let mut idx = 0usize;
+
+    while idx < segments.len() {
+        let (start, end, is_whitespace) = segments[idx];
+        let bytes = &sequence[start..end];
+
+        if !is_whitespace {
+            if let Some(mut pending) = pending_whitespace.take() {
+                if buffer.is_empty() {
+                    out.push(std::mem::take(&mut pending));
+                } else {
+                    buffer.extend_from_slice(&pending);
+                }
+            }
+            buffer.extend_from_slice(bytes);
+            idx += 1;
+            continue;
+        }
+
+        let has_left = !buffer.is_empty();
+        let has_right = segments
+            .get(idx + 1)
+            .map(|(_, _, next_kind)| !next_kind)
+            .unwrap_or(false);
+
+        if has_left && has_right && !should_split(probability, rng) {
+            if let Some(existing) = &mut pending_whitespace {
+                existing.extend_from_slice(bytes);
+            } else {
+                pending_whitespace = Some(bytes.to_vec());
+            }
+            idx += 1;
+            continue;
+        }
+
+        if let Some(pending) = pending_whitespace.take() {
+            if !buffer.is_empty() {
+                out.push(std::mem::take(&mut buffer));
+            }
+            out.push(pending);
+        }
+
+        if !buffer.is_empty() {
+            out.push(std::mem::take(&mut buffer));
+        }
+        out.push(bytes.to_vec());
+        idx += 1;
+    }
+
+    if let Some(pending) = pending_whitespace.take() {
+        if !buffer.is_empty() {
+            out.push(std::mem::take(&mut buffer));
+        }
+        out.push(pending);
+    } else if !buffer.is_empty() {
+        out.push(buffer);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SplitBehavior {
+    Generic,
+    Whitespace,
+}
+
 fn should_split<R: Rng + ?Sized>(probability: f64, rng: &mut R) -> bool {
     if probability >= 1.0 {
         return true;
@@ -221,6 +333,37 @@ fn should_split<R: Rng + ?Sized>(probability: f64, rng: &mut R) -> bool {
         return false;
     }
     rng.gen_bool(probability)
+}
+
+#[cfg(test)]
+fn chunk_is_unicode_whitespace(bytes: &[u8]) -> bool {
+    bstr::BStr::new(bytes).chars().all(|ch| ch.is_whitespace())
+}
+
+#[cfg(test)]
+fn ends_with_unicode_whitespace(bytes: &[u8]) -> bool {
+    bstr::BStr::new(bytes)
+        .chars()
+        .next_back()
+        .map(|ch| ch.is_whitespace())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn chunk_has_mixed_unicode_content(bytes: &[u8]) -> bool {
+    let mut has_whitespace = false;
+    let mut has_non_whitespace = false;
+    for ch in bstr::BStr::new(bytes).chars() {
+        if ch.is_whitespace() {
+            has_whitespace = true;
+        } else {
+            has_non_whitespace = true;
+        }
+        if has_whitespace && has_non_whitespace {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -252,6 +395,58 @@ mod tests {
     }
 
     #[test]
+    fn ascii_whitespace_probabilistic_merges_keep_suffixes_clean() {
+        let seq = b"with respect to hygiene".to_vec();
+        let cfg = PreprocessorConfig {
+            kind: PreprocessorKind::AsciiWhitespace,
+            split_probability: 0.3,
+            seed: Some(7),
+        };
+        let processed = match apply_preprocessor(&cfg, &[seq]) {
+            PreprocessedSequences::Owned(data) => data,
+            _ => panic!("expected owned sequences"),
+        };
+
+        assert!(
+            processed.iter().any(
+                |chunk| chunk.contains(&b' ') && chunk.iter().any(|b| !is_ascii_whitespace(*b))
+            ),
+            "expected merged multi-word chunk"
+        );
+        for chunk in &processed {
+            if let Some(last) = chunk.last() {
+                if is_ascii_whitespace(*last) {
+                    assert!(
+                        chunk.iter().all(|b| is_ascii_whitespace(*b)),
+                        "token {:?} ends with whitespace but is not purely whitespace",
+                        chunk
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_whitespace_merges_create_internal_spacing() {
+        let seq = b"alpha beta gamma".to_vec();
+        let cfg = PreprocessorConfig {
+            kind: PreprocessorKind::AsciiWhitespace,
+            split_probability: 0.000001,
+            seed: Some(1),
+        };
+        let processed = match apply_preprocessor(&cfg, &[seq.clone()]) {
+            PreprocessedSequences::Owned(data) => data,
+            _ => panic!("expected owned sequences"),
+        };
+        assert_eq!(processed.len(), 1);
+        let merged = &processed[0];
+        assert_eq!(merged, &seq);
+        assert!(!merged.first().is_some_and(|b| is_ascii_whitespace(*b)));
+        assert!(!merged.last().is_some_and(|b| is_ascii_whitespace(*b)));
+        assert!(merged.windows(3).any(|w| w == b"a b"));
+    }
+
+    #[test]
     fn unicode_whitespace_combines_multi_byte_runs() {
         let seq = "hi\u{2003}\u{2003}there\u{00A0}you".as_bytes().to_vec();
         let cfg = PreprocessorConfig {
@@ -273,6 +468,33 @@ mod tests {
                 "you".as_bytes().to_vec()
             ]
         );
+    }
+
+    #[test]
+    fn unicode_whitespace_merges_do_not_emit_trailing_separators() {
+        let seq = "foo\u{2003}bar\u{2003}baz".as_bytes().to_vec();
+        let cfg = PreprocessorConfig {
+            kind: PreprocessorKind::UnicodeWhitespace,
+            split_probability: 0.4,
+            seed: Some(77),
+        };
+        let processed = match apply_preprocessor(&cfg, &[seq]) {
+            PreprocessedSequences::Owned(data) => data,
+            _ => panic!("expected owned sequences"),
+        };
+
+        assert!(processed
+            .iter()
+            .any(|chunk| chunk_has_mixed_unicode_content(chunk)));
+        for chunk in &processed {
+            if ends_with_unicode_whitespace(chunk) {
+                assert!(
+                    chunk_is_unicode_whitespace(chunk),
+                    "token {:?} should not have trailing unicode whitespace",
+                    chunk
+                );
+            }
+        }
     }
 
     #[test]
@@ -329,7 +551,8 @@ mod tests {
             vec![
                 b"alpha".to_vec(),
                 b" ".to_vec(),
-                b"beta ".to_vec(),
+                b"beta".to_vec(),
+                b" ".to_vec(),
                 b"gamma".to_vec()
             ]
         );

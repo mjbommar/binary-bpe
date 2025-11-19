@@ -7,16 +7,22 @@ use std::time::Instant;
 use std::{fmt, path::Path};
 
 use log::info;
-use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::bytes::is_allowed_length;
+use crate::bytes::{
+    contains_ascii_letter, ends_with_ascii_whitespace, is_all_ascii_whitespace,
+    is_ascii_whitespace, starts_with_ascii_whitespace,
+};
 use crate::config::{IngestConfig, TrainerBuilder, TrainerConfig};
 use crate::corpus::{load_binary_corpus, load_jsonl_corpus, JsonlSpec};
 use crate::error::{BbpeError, Result};
 use crate::metrics::{sample_rss_kb, IterationMetrics, StopReason, TrainingMetrics};
 use crate::model::{BpeModel, Pair, TokenId};
 use crate::preprocess::apply_preprocessor;
+use crate::special_tokens;
+
+mod word;
+use word::Word;
 
 /// High-level façade configuring and executing BPE training runs.
 #[derive(Debug, Clone)]
@@ -80,38 +86,88 @@ impl Trainer {
 
         let preprocessed = apply_preprocessor(&self.cfg.preprocessor, &sequences);
 
-        let base_vocab = 256usize;
-        let special_count = self.cfg.special_tokens.len();
-        let max_new_tokens = self.cfg.target_vocab_size - base_vocab - special_count;
+        let leading_specials = special_tokens::leading_tokens();
+        let trailing_specials = self.cfg.special_tokens.clone();
+        let leading_count = leading_specials.len();
+        let trailing_count = trailing_specials.len();
+        let byte_vocab = 256usize;
+        let initial_vocab = leading_count + byte_vocab + trailing_count;
+        if self.cfg.target_vocab_size < initial_vocab {
+            return Err(BbpeError::InvalidConfig(
+                "target vocab smaller than required specials + byte alphabet".into(),
+            ));
+        }
+        let max_new_tokens = self.cfg.target_vocab_size - initial_vocab;
         if max_new_tokens == 0 {
             return Err(BbpeError::InvalidConfig(
                 "target vocab leaves no room for merges".into(),
             ));
         }
+        let byte_offset =
+            TokenId::try_from(leading_count).expect("leading special token count fits in TokenId");
 
         let allowed_lengths = self.cfg.allowed_token_lengths.clone();
-        let mut working_sequences: Vec<Vec<TokenId>> = {
+        let aggregated_sequences: FxHashMap<Vec<TokenId>, u64> = {
             let processed = preprocessed.as_slice();
             if processed.is_empty() {
                 return Err(BbpeError::InvalidConfig(
-                     "preprocessing removed all sequences; adjust the preprocessor or provide non-empty spans".into(),
-                 ));
+                    "preprocessing removed all sequences; adjust the preprocessor or provide non-empty spans"
+                        .into(),
+                ));
             }
-            processed
-                .iter()
-                .map(|seq| seq.iter().map(|&b| TokenId::from(b)).collect())
-                .collect()
+            let mut map = FxHashMap::default();
+            for seq in processed {
+                if seq.is_empty() {
+                    continue;
+                }
+                let tokens: Vec<TokenId> = seq
+                    .iter()
+                    .map(|&b| byte_offset + TokenId::from(b))
+                    .collect();
+                *map.entry(tokens).or_insert(0) += 1;
+            }
+            map
         };
 
         drop(preprocessed);
         drop(sequences);
 
-        let mut token_bytes: Vec<Vec<u8>> = (0u8..=u8::MAX).map(|b| vec![b]).collect();
-        let mut token_lengths: Vec<usize> = vec![1; token_bytes.len()];
+        if aggregated_sequences.is_empty() {
+            return Err(BbpeError::InvalidConfig(
+                "training requires at least one non-empty sequence after preprocessing".into(),
+            ));
+        }
+
+        let mut token_bytes: Vec<Vec<u8>> = Vec::with_capacity(self.cfg.target_vocab_size);
+        let mut token_lengths: Vec<usize> = Vec::with_capacity(self.cfg.target_vocab_size);
+        for token in leading_specials {
+            let bytes = token.as_bytes().to_vec();
+            token_lengths.push(bytes.len());
+            token_bytes.push(bytes);
+        }
+        for byte in 0u8..=u8::MAX {
+            token_bytes.push(vec![byte]);
+            token_lengths.push(1);
+        }
+        for token in &trailing_specials {
+            let bytes = token.as_bytes().to_vec();
+            token_lengths.push(bytes.len());
+            token_bytes.push(bytes);
+        }
         let mut merges: Vec<Pair> = Vec::with_capacity(max_new_tokens);
 
-        let mut pair_counts =
-            compute_pair_counts(&working_sequences, &token_lengths, &allowed_lengths);
+        let (mut words, counts): (Vec<Word>, Vec<u64>) = {
+            let mut local_words = Vec::with_capacity(aggregated_sequences.len());
+            let mut local_counts = Vec::with_capacity(aggregated_sequences.len());
+            for (tokens, count) in aggregated_sequences {
+                local_words.push(Word::from_tokens(tokens));
+                local_counts.push(count);
+            }
+            (local_words, local_counts)
+        };
+
+        let (mut pair_counts, mut pair_positions) =
+            compute_pair_stats(&words, &counts, &allowed_lengths);
         let mut heap = BinaryHeap::with_capacity(pair_counts.len().max(1));
         for (&pair, &count) in &pair_counts {
             if count >= self.cfg.min_frequency {
@@ -184,18 +240,39 @@ impl Trainer {
             let mut new_token = Vec::with_capacity(combined_len);
             new_token.extend_from_slice(&token_bytes[best_pair.0 as usize]);
             new_token.extend_from_slice(&token_bytes[best_pair.1 as usize]);
+
+            if ends_with_ascii_whitespace(&new_token) && !is_all_ascii_whitespace(&new_token) {
+                pair_counts.remove(&best_pair);
+                continue;
+            }
+            if self.cfg.require_letter_whitespace_merges
+                && new_token.iter().copied().any(is_ascii_whitespace)
+                && !is_all_ascii_whitespace(&new_token)
+                && !contains_ascii_letter(&new_token)
+            {
+                pair_counts.remove(&best_pair);
+                continue;
+            }
+            if self.cfg.forbid_leading_whitespace_merges
+                && starts_with_ascii_whitespace(&new_token)
+                && !is_all_ascii_whitespace(&new_token)
+            {
+                pair_counts.remove(&best_pair);
+                continue;
+            }
             let new_token_id = TokenId::try_from(token_bytes.len())
                 .map_err(|_| BbpeError::Internal("vocabulary size exceeded u32::MAX".into()))?;
 
             let total_merges = apply_merge(
-                &mut working_sequences,
+                &mut words,
+                &counts,
                 best_pair,
                 new_token_id,
                 combined_len,
                 &mut pair_counts,
                 &mut heap,
-                &token_lengths,
                 &allowed_lengths,
+                &mut pair_positions,
             );
 
             if total_merges == 0 {
@@ -215,7 +292,7 @@ impl Trainer {
                     frequency,
                     total_merges,
                     pair_counts.len(),
-                    base_vocab + iteration
+                    initial_vocab + iteration
                 );
             }
 
@@ -242,9 +319,15 @@ impl Trainer {
                 "completed {} merges in {:.2?}; vocab size {}",
                 merges.len(),
                 total_duration,
-                token_bytes.len() + self.cfg.special_tokens.len()
+                token_bytes.len()
             );
         }
+
+        pad_vocabulary_with_whitespace(
+            &mut token_bytes,
+            &mut token_lengths,
+            self.cfg.target_vocab_size,
+        );
 
         let model = BpeModel::new(token_bytes, merges, self.cfg.clone());
         Ok(TrainerArtifacts { model, metrics })
@@ -275,58 +358,6 @@ impl PartialOrd for PairScore {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
-}
-
-fn compute_pair_counts(
-    sequences: &[Vec<TokenId>],
-    token_lengths: &[usize],
-    allowed_lengths: &[usize],
-) -> FxHashMap<Pair, usize> {
-    sequences
-        .par_iter()
-        .map(|sequence| {
-            let mut local = FxHashMap::default();
-            if sequence.len() < 2 {
-                return local;
-            }
-            let mut prev = sequence[0];
-            for &current in &sequence[1..] {
-                let combined_len = token_lengths[prev as usize] + token_lengths[current as usize];
-                if is_allowed_length(combined_len, allowed_lengths) {
-                    *local.entry((prev, current)).or_insert(0) += 1;
-                }
-                prev = current;
-            }
-            local
-        })
-        .reduce(FxHashMap::default, |mut acc, local| {
-            for (pair, count) in local {
-                *acc.entry(pair).or_insert(0) += count;
-            }
-            acc
-        })
-}
-
-#[derive(Default)]
-struct MergeAdjustments {
-    deltas: FxHashMap<Pair, i64>,
-    merges: usize,
-}
-
-fn accumulate_delta(
-    deltas: &mut FxHashMap<Pair, i64>,
-    pair: Pair,
-    combined_len: usize,
-    allowed_lengths: &[usize],
-    delta: i64,
-) {
-    if delta == 0 {
-        return;
-    }
-    if !is_allowed_length(combined_len, allowed_lengths) {
-        return;
-    }
-    *deltas.entry(pair).or_insert(0) += delta;
 }
 
 fn apply_delta(
@@ -364,157 +395,119 @@ fn apply_delta(
     }
 }
 
-fn token_length_with_new(
-    token: TokenId,
-    token_lengths: &[usize],
-    new_token: TokenId,
-    new_token_len: usize,
-) -> usize {
-    if token == new_token {
-        new_token_len
-    } else {
-        token_lengths[token as usize]
-    }
-}
-
-fn process_sequence(
-    sequence: &mut Vec<TokenId>,
-    pair: Pair,
-    new_token: TokenId,
-    new_token_len: usize,
-    token_lengths: &[usize],
-    allowed_lengths: &[usize],
-) -> MergeAdjustments {
-    let mut result = MergeAdjustments::default();
-    if sequence.len() < 2 {
-        return result;
-    }
-
-    let mut read = 0usize;
-    let mut write = 0usize;
-    let original_len = sequence.len();
-    let left_len = token_lengths[pair.0 as usize];
-    let right_len = token_lengths[pair.1 as usize];
-
-    while read < original_len {
-        if read + 1 < original_len && sequence[read] == pair.0 && sequence[read + 1] == pair.1 {
-            let prev_token = if write > 0 {
-                Some(sequence[write - 1])
-            } else {
-                None
-            };
-            let next_token = if read + 2 < original_len {
-                Some(sequence[read + 2])
-            } else {
-                None
-            };
-
-            if let Some(prev) = prev_token {
-                let prev_len = token_length_with_new(prev, token_lengths, new_token, new_token_len);
-                let combined = prev_len + left_len;
-                accumulate_delta(
-                    &mut result.deltas,
-                    (prev, pair.0),
-                    combined,
-                    allowed_lengths,
-                    -1,
-                );
-            }
-            accumulate_delta(
-                &mut result.deltas,
-                pair,
-                left_len + right_len,
-                allowed_lengths,
-                -1,
-            );
-            if let Some(next) = next_token {
-                let next_len = token_length_with_new(next, token_lengths, new_token, new_token_len);
-                let combined = right_len + next_len;
-                accumulate_delta(
-                    &mut result.deltas,
-                    (pair.1, next),
-                    combined,
-                    allowed_lengths,
-                    -1,
-                );
-            }
-
-            sequence[write] = new_token;
-            write += 1;
-            read += 2;
-            result.merges += 1;
-
-            if let Some(prev) = prev_token {
-                let prev_len = token_length_with_new(prev, token_lengths, new_token, new_token_len);
-                let combined = prev_len + new_token_len;
-                accumulate_delta(
-                    &mut result.deltas,
-                    (prev, new_token),
-                    combined,
-                    allowed_lengths,
-                    1,
-                );
-            }
-            if let Some(next) = next_token {
-                let next_len = token_length_with_new(next, token_lengths, new_token, new_token_len);
-                let combined = new_token_len + next_len;
-                accumulate_delta(
-                    &mut result.deltas,
-                    (new_token, next),
-                    combined,
-                    allowed_lengths,
-                    1,
-                );
-            }
-        } else {
-            if write != read {
-                sequence[write] = sequence[read];
-            }
-            write += 1;
-            read += 1;
-        }
-    }
-
-    sequence.truncate(write);
-    result
-}
-
 #[allow(clippy::too_many_arguments)]
 fn apply_merge(
-    sequences: &mut [Vec<TokenId>],
+    words: &mut [Word],
+    counts: &[u64],
     pair: Pair,
     new_token: TokenId,
     new_token_len: usize,
     pair_counts: &mut FxHashMap<Pair, usize>,
     heap: &mut BinaryHeap<PairScore>,
-    token_lengths: &[usize],
     allowed_lengths: &[usize],
+    pair_positions: &mut FxHashMap<Pair, FxHashSet<usize>>,
 ) -> usize {
-    let aggregate = sequences
-        .par_iter_mut()
-        .map(|sequence| {
-            process_sequence(
-                sequence,
-                pair,
-                new_token,
-                new_token_len,
-                token_lengths,
-                allowed_lengths,
-            )
-        })
-        .reduce(MergeAdjustments::default, |mut acc, mut local| {
-            acc.merges += local.merges;
-            for (pair_key, delta) in local.deltas.drain() {
-                *acc.deltas.entry(pair_key).or_insert(0) += delta;
-            }
-            acc
-        });
+    let positions = pair_positions.remove(&pair).unwrap_or_default();
+    if positions.is_empty() {
+        return 0;
+    }
 
-    for (pair_key, delta) in aggregate.deltas {
+    let mut aggregate_deltas: FxHashMap<Pair, i64> = FxHashMap::default();
+    let mut total_merges = 0usize;
+
+    for idx in positions {
+        if idx >= words.len() {
+            continue;
+        }
+        let result = words[idx].merge(pair.0, pair.1, new_token, new_token_len, allowed_lengths);
+        if result.merges == 0 {
+            continue;
+        }
+        let weight_usize: usize = counts[idx]
+            .try_into()
+            .expect("sequence count must fit in usize");
+        let weight_i64 = counts[idx] as i64;
+        total_merges += result.merges * weight_usize;
+
+        for (pair_key, delta) in result.deltas {
+            let weighted = (delta as i64) * weight_i64;
+            if weighted == 0 {
+                continue;
+            }
+            *aggregate_deltas.entry(pair_key).or_insert(0) += weighted;
+            if delta > 0 {
+                pair_positions.entry(pair_key).or_default().insert(idx);
+            }
+        }
+    }
+
+    for (pair_key, delta) in aggregate_deltas {
         apply_delta(pair_counts, heap, pair_key, delta);
     }
 
-    aggregate.merges
+    total_merges
+}
+
+fn compute_pair_stats(
+    words: &[Word],
+    counts: &[u64],
+    allowed_lengths: &[usize],
+) -> (FxHashMap<Pair, usize>, FxHashMap<Pair, FxHashSet<usize>>) {
+    let mut pair_counts: FxHashMap<Pair, usize> = FxHashMap::default();
+    let mut pair_positions: FxHashMap<Pair, FxHashSet<usize>> = FxHashMap::default();
+
+    for (idx, word) in words.iter().enumerate() {
+        if !word.has_pairs() {
+            continue;
+        }
+        let weight: usize = counts[idx]
+            .try_into()
+            .expect("sequence count must fit in usize");
+        word.for_each_pair(allowed_lengths, |pair| {
+            *pair_counts.entry(pair).or_insert(0) += weight;
+            pair_positions.entry(pair).or_default().insert(idx);
+        });
+    }
+
+    (pair_counts, pair_positions)
+}
+
+const WHITESPACE_PADDING_BYTES: [u8; 4] = [b' ', b'\t', b'\n', b'\r'];
+
+fn pad_vocabulary_with_whitespace(
+    token_bytes: &mut Vec<Vec<u8>>,
+    token_lengths: &mut Vec<usize>,
+    target_vocab_size: usize,
+) {
+    if token_bytes.len() >= target_vocab_size {
+        return;
+    }
+    let mut existing: FxHashSet<Vec<u8>> = token_bytes.iter().cloned().collect();
+    let mut needed = target_vocab_size - token_bytes.len();
+    let mut run_len = 2usize;
+    while needed > 0 {
+        for &byte in &WHITESPACE_PADDING_BYTES {
+            if needed == 0 {
+                break;
+            }
+            let candidate = vec![byte; run_len];
+            if existing.insert(candidate.clone()) {
+                token_lengths.push(candidate.len());
+                token_bytes.push(candidate);
+                needed -= 1;
+            }
+        }
+        run_len += 1;
+    }
+
+    while token_bytes.len() < target_vocab_size {
+        let mut candidate = vec![0u8, (token_bytes.len() & 0xFF) as u8];
+        while !existing.insert(candidate.clone()) {
+            candidate[1] = candidate[1].wrapping_add(1);
+        }
+        token_lengths.push(candidate.len());
+        token_bytes.push(candidate);
+    }
 }
 
 impl fmt::Display for TrainerArtifacts {
@@ -529,6 +522,10 @@ impl fmt::Display for TrainerArtifacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytes::{
+        contains_ascii_letter, ends_with_ascii_whitespace, is_all_ascii_whitespace,
+        is_ascii_whitespace,
+    };
     use crate::model::BinaryTokenizer;
     use crate::serialization;
     use tempfile::tempdir;
@@ -538,6 +535,7 @@ mod tests {
             .min_frequency(min_frequency)
             .target_vocab_size(vocab_size)
             .special_tokens(Vec::<String>::new())
+            .reasoning_tokens_enabled(false)
             .show_progress(false)
             .build()
             .unwrap();
@@ -573,15 +571,105 @@ mod tests {
     #[test]
     fn tokenizer_saves_huggingface_json() {
         let sequences = vec![vec![0, 1, 2, 3, 4, 5, 6, 7, 8]];
-        let trainer = trainer(1, 258);
+        let trainer = trainer(1, 270);
         let artefacts = trainer.train_from_sequences(sequences).unwrap();
         let dir = tempdir().unwrap();
         let path = dir.path().join("tokenizer.json");
         artefacts.model.save_huggingface(&path).unwrap();
         let tokenizer = serialization::load_tokenizer(&path).unwrap();
+        assert_eq!(tokenizer.get_vocab_size(true), artefacts.model.vocab_size());
+    }
+
+    #[test]
+    fn merges_do_not_leave_trailing_whitespace_tokens() {
+        let sequences = vec![b"alpha beta gamma ".to_vec(); 64];
+        let trainer = trainer(2, 270);
+        let artefacts = trainer.train_from_sequences(sequences).unwrap();
+        for token in artefacts.model.token_bytes() {
+            if token.is_empty() {
+                continue;
+            }
+            if ends_with_ascii_whitespace(token) {
+                assert!(is_all_ascii_whitespace(token));
+            }
+        }
+    }
+
+    #[test]
+    fn whitespace_merges_require_letters_enforced() {
+        let sequences = vec![b"123 456 ".to_vec(); 64];
+        let cfg = TrainerConfig::builder()
+            .min_frequency(2)
+            .target_vocab_size(270)
+            .special_tokens(Vec::<String>::new())
+            .reasoning_tokens_enabled(false)
+            .show_progress(false)
+            .require_letter_whitespace_merges(true)
+            .build()
+            .unwrap();
+        let trainer = Trainer::new(cfg);
+        let artefacts = trainer.train_from_sequences(sequences).unwrap();
+        for token in artefacts.model.token_bytes() {
+            if token.is_empty() {
+                continue;
+            }
+            let has_ws = token.iter().copied().any(is_ascii_whitespace);
+            if has_ws && !is_all_ascii_whitespace(token) {
+                assert!(contains_ascii_letter(token));
+            }
+        }
+    }
+
+    #[test]
+    fn leading_whitespace_merges_are_forbidden() {
+        let sequences = vec![b" foo".to_vec(); 64];
+        let cfg = TrainerConfig::builder()
+            .min_frequency(2)
+            .target_vocab_size(270)
+            .special_tokens(Vec::<String>::new())
+            .reasoning_tokens_enabled(false)
+            .show_progress(false)
+            .forbid_leading_whitespace_merges(true)
+            .build()
+            .unwrap();
+        let trainer = Trainer::new(cfg);
+        let artefacts = trainer.train_from_sequences(sequences).unwrap();
+        for token in artefacts.model.token_bytes() {
+            if token.is_empty() {
+                continue;
+            }
+            let starts_ws = token.first().copied().is_some_and(is_ascii_whitespace);
+            if starts_ws && !is_all_ascii_whitespace(token) {
+                panic!("token {:?} should not start with whitespace", token);
+            }
+        }
+    }
+
+    #[test]
+    fn trainer_pads_vocab_with_whitespace_tokens() {
+        let sequences = vec![b"ab".to_vec()];
+        let cfg = TrainerConfig::builder()
+            .min_frequency(10)
+            .target_vocab_size(267)
+            .special_tokens(Vec::<String>::new())
+            .reasoning_tokens_enabled(false)
+            .show_progress(false)
+            .max_merge_iterations(Some(0))
+            .build()
+            .unwrap();
+        let trainer = Trainer::new(cfg);
+        let artefacts = trainer.train_from_sequences(sequences).unwrap();
+        assert_eq!(artefacts.model.vocab_size(), 267);
+        let extras = artefacts.model.token_bytes();
+        let extras = &extras[extras.len().saturating_sub(4)..];
         assert_eq!(
-            tokenizer.get_vocab_size(false),
-            artefacts.model.vocab_size()
+            extras,
+            &[
+                b"  ".to_vec(),
+                b"\t\t".to_vec(),
+                b"\n\n".to_vec(),
+                b"\r\r".to_vec()
+            ]
         );
     }
 }
