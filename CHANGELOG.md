@@ -3,6 +3,12 @@
 ## Unreleased
 - _Nothing yet._
 
+## 0.6.0 - 2025-11-19
+- Locked the Category 3 specials (`<|start|>` … `<|mask|>`) to token IDs 0–6 across every model via the new `references/special_tokens.json`, guaranteeing deterministic layouts for both the CLI and the library.
+- Inserted the full set of Category 4 reasoning tokens immediately after the 256-byte alphabet, enabled by default but controllable through `--disable-reasoning-tokens` / `TrainerBuilder::reasoning_tokens_enabled(false)`; extra custom specials are now appended without disturbing the reserved slots.
+- Reworked Hugging Face serialization and `BinaryTokenizer` metadata so exported `tokenizer.json` files preserve the fixed IDs, `bbpe info` reports base/special/total counts (embedding width), and round-trip encode/decode matches exactly when checked via `uv run --with tokenizers python -c ...`.
+- Refined probabilistic whitespace preprocessing to keep whitespace-only spans clean while still enabling multi-word merges when `--preprocessor-probability < 1`, and expanded documentation/tests covering the reserved-token workflow.
+
 ## 0.5.0 - 2025-11-14
 - Added configurable ASCII, Unicode, and null-delimited preprocessing to both the library (`TrainerConfig::preprocessor`) and CLI (`--preprocessor`), wiring the behaviour into exported Hugging Face tokenizers.
 - Introduced probabilistic preprocessing with optional RNG seeding (`--preprocessor-probability`, `--preprocessor-seed`, and the new builder helpers), allowing occasional cross-delimiter merges while keeping inference aligned with the raw byte stream whenever randomness is enabled.

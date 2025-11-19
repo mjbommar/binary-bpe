@@ -15,13 +15,13 @@ Binary-aware byte pair encoding (BPE) toolkit for Rust. `bbpe` trains Hugging Fa
 cargo install bbpe
 
 # Add as a dependency (library only)
-cargo add bbpe@0.5.0
+cargo add bbpe@0.6.0
 ```
 
 For library-only usage without the CLI feature:
 
 ```toml
-bbpe = { version = "0.5", default-features = false }
+bbpe = { version = "0.6", default-features = false }
 ```
 
 ## Quick Start
@@ -77,9 +77,12 @@ Key options:
 | `--min-frequency COUNT` | Minimum pair frequency for merges (default 4). |
 | `--chunk-size BYTES` | Read binary inputs in chunks (default 8192, `0` = whole file). |
 | `--special-token TOKEN` | Append custom special tokens (repeatable). |
+| `--disable-reasoning-tokens` | Drop the optional reasoning/argument tokens (Category 4). Core tokens remain enabled. |
 | `--preprocessor MODE` | `none`, `ascii-whitespace`, `unicode-whitespace`, or `null-delimited`. |
 | `--preprocessor-probability P` | Probability `[0,1]` that each detected boundary is kept (default `1.0`). Set `< 1` to occasionally merge across whitespace/null runs. |
 | `--preprocessor-seed SEED` | Seed RNG for probabilistic preprocessing. |
+| `--whitespace-merges-require-letter` | When set, any merge that creates a token containing whitespace must also include at least one ASCII letter (pure whitespace runs still pass). |
+| `--forbid-leading-whitespace-merges` | Forbids merges whose tokens *start* with ASCII whitespace unless the entire token is whitespace. |
 | `--family-size SIZE` | Emit derived vocabularies after training (repeat flag). |
 | `--family-template PATTERN` | Output template for derived models (supports `{size}`). |
 | `--max-merge-iterations COUNT` | Hard merge ceiling (defaults to vocab budget). |
@@ -102,6 +105,7 @@ Notable flags:
 - `--combine-mode first|frequency|support|entropy`
 - `--duplicates count|unique`
 - `--output PATH`, `--report PATH`, `--no-report`
+- `--disable-reasoning-tokens`
 - Same preprocessing / probability knobs as `train`. (Currently, JSONL ingestion is only available on the main `train` command.)
 
 ### `encode`
@@ -122,6 +126,25 @@ bbpe decode -m tokenizer.json [IDS]... [--input PATH] [--output PATH] [--skip-sp
 bbpe info -m tokenizer.json [--json]
 ```
 
+## Special Token Layout & Verification
+
+Every tokenizer now shares a deterministic layout:
+
+1. Category 3 tokens `<|start|>`, `<|end|>`, `<|pad|>`, `<|unk|>`, `<|cls|>`, `<|sep|>`, `<|mask|>` are always IDs `0-6`.
+2. The raw byte alphabet (`0x00`–`0xFF`) fills IDs `7-262`.
+3. The 47 Category 4 reasoning tokens occupy the next block by default (disable them with `--disable-reasoning-tokens` or `TrainerBuilder::reasoning_tokens_enabled(false)`).
+4. Any additional custom specials you pass via `--special-token` are appended after the reserved IDs, followed by the learned “real” vocabulary.
+
+`bbpe info -m tokenizer.json` now prints the base, special, and total counts so you can confirm the embedding dimension (`total`) and ensure the optional reasoning tokens are toggled the way you expect.
+
+From Python, you can double-check the Hugging Face view with `uv` (replace the path with your tokenizer):
+
+```bash
+uv run --with tokenizers python -c "from tokenizers import Tokenizer; tok = Tokenizer.from_file('artifacts/tokenizer.json'); specials = ['<|start|>','<|end|>','<|pad|>','<|unk|>','<|cls|>','<|sep|>','<|mask|>']; assert [tok.token_to_id(t) for t in specials] == list(range(len(specials))); print('total vocab =', tok.get_vocab_size(with_added_tokens=True))"
+```
+
+That script is the same check the CLI tests run: it ensures Hugging Face loads the tokenizer with the reserved IDs intact and reports the exact vocabulary/embedding size.
+
 ## Preprocessing Modes
 
 `bbpe` optionally splits inputs before merge counting:
@@ -132,6 +155,12 @@ bbpe info -m tokenizer.json [--json]
 - **none** – Raw byte stream.
 
 Set `--preprocessor-probability <P>` (or `TrainerConfig::builder().preprocessor_split_probability(P)`) to randomly *keep* only a subset of boundaries. Example: `P=0.8` keeps 80 % of whitespace splits while letting 20 % of tokens cross word boundaries, encouraging the model to learn multi-word merges. Provide `--preprocessor-seed` for reproducibility. Hugging Face exports automatically drop the pre-tokenizer section when `P < 1.0`, so downstream inference sees the exact byte stream used during training.
+
+Enable `--whitespace-merges-require-letter` (or `TrainerConfig::builder().require_letter_whitespace_merges(true)`) to stop numeric/punctuation-only spans from merging with whitespace while still permitting true words (containing ASCII letters) to retain their surrounding spaces. Add `--forbid-leading-whitespace-merges` (or `.forbid_leading_whitespace_merges(true)`) when you want all learned tokens to begin with non-whitespace bytes, keeping boundary markers in their own tokens while still allowing internal whitespace.
+
+**Recommendation:** for “WordPiece-but-with-multi-word” behavior, we’ve had good luck with `--preprocessor ascii-whitespace`, `--preprocessor-probability 0.6–0.75`, and `--whitespace-merges-require-letter`. This keeps token embeddings compact (no trailing spaces, no punctuation-only merges) while still allowing high-value phrases like “of the” or “## CHAPTER” to form. On very large corpora, start at the higher end of that range (∼0.7) so merge counts stay stable and RSS doesn’t spike, then experiment downward if you need more aggressive phrase compression.
+
+When you stick with the defaults, bbpe now caps merge lengths at 16 bytes whenever the preprocessor is `ascii-whitespace` or `unicode-whitespace`, mirroring WordPiece-style subwords. Binary/no-preprocessor runs keep the original 32-byte ceiling. Override this at any time via repeated `--allowed-length` flags (or `.allowed_token_lengths()` in code) if you need longer tokens for a particular corpus.
 
 ## JSONL Ingestion
 
