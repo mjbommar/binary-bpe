@@ -202,6 +202,22 @@ bbpe train corpus.bin --vocab-size 32768 \
 
 `BpeModel::derive_with_vocab(size)` mirrors the CLI for library users. Special tokens remain clustered at the end so IDs stay consistent across the family.
 
+## Special Token Numbering
+
+Special tokens (added via `--special-token` or `TrainerConfig::special_tokens`) are always assigned the **lowest contiguous ID range `[0, N)`** where N is the number of special tokens. This normalization happens during serialization to Hugging Face format and applies to both `train` and `chunk-train` algorithms.
+
+For example, with 2 special tokens `<|start|>` and `<|end|>`:
+- Special token IDs: `[0, 1]`
+- Base byte vocabulary: `[2, 257]` (256 bytes)
+- Learned merges: `[258, ...]`
+
+This ensures:
+- Consistent token IDs across derived vocabulary families
+- Compatibility with Hugging Face tokenizers library expectations
+- Deterministic special token numbering regardless of training algorithm
+
+The base 256-byte vocabulary and learned merges never participate in this normalization; only special tokens are renumbered.
+
 ## Chunk Training (experimental)
 
 `bbpe chunk-train` slices the corpus into fixed-size windows, trains independent vocabularies, and merges them via user-selectable strategies (`support`, `frequency`, etc.). Duplicate chunk caching, entropy filtering, and reporting are built in so you can prototype large corpora without huge memory spikes.

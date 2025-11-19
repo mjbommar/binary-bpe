@@ -9,6 +9,9 @@
 - Reworked Hugging Face serialization and `BinaryTokenizer` metadata so exported `tokenizer.json` files preserve the fixed IDs, `bbpe info` reports base/special/total counts (embedding width), and round-trip encode/decode matches exactly when checked via `uv run --with tokenizers python -c ...`.
 - Refined probabilistic whitespace preprocessing to keep whitespace-only spans clean while still enabling multi-word merges when `--preprocessor-probability < 1`, and expanded documentation/tests covering the reserved-token workflow.
 
+## 0.5.2 - 2025-11-18
+- Documented special token numbering behavior: special tokens are always assigned the lowest contiguous ID range `[0, N)` where N is the number of special tokens, ensuring consistency across both `train` and `chunk-train` algorithms and compatibility with Hugging Face tokenizers.
+
 ## 0.5.0 - 2025-11-14
 - Added configurable ASCII, Unicode, and null-delimited preprocessing to both the library (`TrainerConfig::preprocessor`) and CLI (`--preprocessor`), wiring the behaviour into exported Hugging Face tokenizers.
 - Introduced probabilistic preprocessing with optional RNG seeding (`--preprocessor-probability`, `--preprocessor-seed`, and the new builder helpers), allowing occasional cross-delimiter merges while keeping inference aligned with the raw byte stream whenever randomness is enabled.

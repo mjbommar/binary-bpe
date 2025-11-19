@@ -162,6 +162,81 @@ fn train_encode_decode_round_trip() {
 }
 
 #[test]
+fn special_tokens_are_assigned_lowest_ids() {
+    let workspace = temp_workspace();
+    let input_path = workspace.path().join("input.bin");
+    let output_path = workspace.path().join("tokenizer.json");
+    let custom_token = "<|custom-special|>";
+
+    let data: Vec<u8> = (0..=255).cycle().take(2048).collect();
+    fs::write(&input_path, &data).expect("write input");
+
+    let mut train = Command::cargo_bin("bbpe").expect("binary exists");
+    train.current_dir(workspace.path()).args([
+        "--quiet",
+        "train",
+        input_path.file_name().unwrap().to_str().unwrap(),
+        "--vocab-size",
+        "270",
+        "--min-frequency",
+        "2",
+        "--no-progress",
+        "--chunk-size",
+        "1024",
+        "--disable-reasoning-tokens",
+        "--special-token",
+        custom_token,
+        "-o",
+        output_path.file_name().unwrap().to_str().unwrap(),
+    ]);
+    run_command(&mut train);
+
+    let mut info = Command::cargo_bin("bbpe").expect("binary exists");
+    info.current_dir(workspace.path()).args([
+        "--quiet",
+        "info",
+        "-m",
+        output_path.file_name().unwrap().to_str().unwrap(),
+        "--json",
+    ]);
+    let info_output = info.assert().success().get_output().stdout.clone();
+    let summary: Value = serde_json::from_slice(&info_output).expect("info output is valid JSON");
+
+    let special_ids = summary["special_token_ids"]
+        .as_object()
+        .expect("special_token_ids present");
+    let leading = [
+        "<|start|>",
+        "<|end|>",
+        "<|pad|>",
+        "<|unk|>",
+        "<|cls|>",
+        "<|sep|>",
+        "<|mask|>",
+    ];
+    for (idx, token) in leading.iter().enumerate() {
+        let value = special_ids
+            .get(*token)
+            .unwrap_or_else(|| panic!("missing special token id for {token}"));
+        assert_eq!(
+            value.as_u64().unwrap(),
+            idx as u64,
+            "{token} should have ID {idx}"
+        );
+    }
+    let custom_id = special_ids
+        .get(custom_token)
+        .expect("custom special token recorded")
+        .as_u64()
+        .expect("custom special token id is u64");
+    assert_eq!(
+        custom_id,
+        (leading.len() + 256) as u64,
+        "custom specials should begin immediately after the byte alphabet"
+    );
+}
+
+#[test]
 fn train_from_jsonl_field() {
     let workspace = temp_workspace();
     let jsonl_path = workspace.path().join("records.jsonl");
