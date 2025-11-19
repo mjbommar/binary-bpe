@@ -51,6 +51,7 @@ pub mod metrics;
 pub mod model;
 pub mod preprocess;
 pub mod serialization;
+pub mod special_tokens;
 pub mod trainer;
 
 pub use config::{

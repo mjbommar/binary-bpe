@@ -3,11 +3,12 @@
 use std::fs;
 use std::path::Path;
 
-use serde_json::{self, Value};
+use serde_json::{self, json, Value};
 use tokenizers::Tokenizer;
 
 use crate::error::{BbpeError, Result};
 use crate::model::BpeModel;
+use crate::special_tokens;
 
 /// Builds a Hugging Face tokenizer from the trained model.
 pub fn as_tokenizer(model: &BpeModel) -> Result<Tokenizer> {
@@ -29,6 +30,32 @@ pub fn tokenizer_json(model: &BpeModel, pretty: bool) -> Result<String> {
     {
         value["decoder"] = serde_json::json!({"type": "Fuse"});
     }
+
+    let mut added_tokens = Vec::new();
+    for (idx, token) in special_tokens::leading_tokens().iter().enumerate() {
+        added_tokens.push(json!({
+            "id": idx as u32,
+            "content": token,
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true
+        }));
+    }
+    let trailing_start = special_tokens::leading_tokens().len() + 256;
+    for (offset, token) in model.special_tokens().iter().enumerate() {
+        added_tokens.push(json!({
+            "id": (trailing_start + offset) as u32,
+            "content": token,
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true
+        }));
+    }
+    value["added_tokens"] = Value::Array(added_tokens);
 
     if pretty {
         serde_json::to_string_pretty(&value).map_err(|err| BbpeError::Tokenizers(err.to_string()))

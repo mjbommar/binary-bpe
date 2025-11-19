@@ -14,6 +14,7 @@ use bbpe::config::{IngestConfig, PreprocessorConfig, PreprocessorKind, TrainerCo
 use bbpe::corpus::{load_binary_corpus, load_jsonl_corpus, stream_binary_corpus, JsonlSpec};
 use bbpe::model::{Pair, TokenId};
 use bbpe::serialization;
+use bbpe::special_tokens;
 use bbpe::{BinaryTokenizer, BpeModel, Trainer, TrainerArtifacts};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
@@ -98,6 +99,10 @@ struct TrainArgs {
     #[arg(long = "special-token", value_name = "TOKEN")]
     special_tokens: Vec<String>,
 
+    /// Disable the optional reasoning/argument special tokens
+    #[arg(long = "disable-reasoning-tokens")]
+    disable_reasoning_tokens: bool,
+
     /// Preprocessor applied before merge counting
     #[arg(
         long = "preprocessor",
@@ -167,6 +172,14 @@ struct TrainArgs {
     /// Output template for derived family members (supports `{size}`)
     #[arg(long = "family-template", value_name = "PATTERN")]
     family_template: Option<String>,
+
+    /// Require ASCII letters inside tokens that contain whitespace merges
+    #[arg(long = "whitespace-merges-require-letter")]
+    whitespace_merges_require_letter: bool,
+
+    /// Forbid merges that introduce leading ASCII whitespace (unless pure whitespace)
+    #[arg(long = "forbid-leading-whitespace-merges")]
+    forbid_leading_whitespace_merges: bool,
 }
 
 #[derive(Args, Debug)]
@@ -210,6 +223,10 @@ struct ChunkTrainArgs {
     /// Append additional special tokens
     #[arg(long = "special-token", value_name = "TOKEN")]
     special_tokens: Vec<String>,
+
+    /// Disable the optional reasoning/argument special tokens
+    #[arg(long = "disable-reasoning-tokens")]
+    disable_reasoning_tokens: bool,
 
     /// Preprocessor applied before merge counting
     #[arg(
@@ -272,6 +289,14 @@ struct ChunkTrainArgs {
     /// Output template for derived family members (supports `{size}`)
     #[arg(long = "family-template", value_name = "PATTERN")]
     family_template: Option<String>,
+
+    /// Require ASCII letters inside tokens that contain whitespace merges
+    #[arg(long = "whitespace-merges-require-letter")]
+    whitespace_merges_require_letter: bool,
+
+    /// Forbid merges that introduce leading ASCII whitespace (unless pure whitespace)
+    #[arg(long = "forbid-leading-whitespace-merges")]
+    forbid_leading_whitespace_merges: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -712,10 +737,25 @@ fn assemble_aggregated_merges(
     trainer_cfg: &TrainerConfig,
 ) -> Result<(BpeModel, CombineStats)> {
     let requested = target_merge_budget(trainer_cfg);
-    let mut token_bytes: Vec<Vec<u8>> = (0u8..=u8::MAX).map(|b| vec![b]).collect();
+    let leading = special_tokens::leading_tokens();
+    let trailing = trainer_cfg.special_tokens.clone();
     let mut token_map: FxHashMap<Vec<u8>, TokenId> = FxHashMap::default();
-    for (idx, token) in token_bytes.iter().enumerate() {
-        token_map.insert(token.clone(), idx as TokenId);
+    let mut token_bytes: Vec<Vec<u8>> = Vec::new();
+
+    for token in leading {
+        let bytes = token.as_bytes().to_vec();
+        token_map.insert(bytes.clone(), token_bytes.len() as TokenId);
+        token_bytes.push(bytes);
+    }
+    for byte in 0u8..=u8::MAX {
+        let bytes = vec![byte];
+        token_map.insert(bytes.clone(), token_bytes.len() as TokenId);
+        token_bytes.push(bytes);
+    }
+    for token in &trailing {
+        let bytes = token.as_bytes().to_vec();
+        token_map.insert(bytes.clone(), token_bytes.len() as TokenId);
+        token_bytes.push(bytes);
     }
 
     let mut merges: Vec<Pair> = Vec::with_capacity(requested);
@@ -793,7 +833,7 @@ fn assemble_aggregated_merges(
 }
 
 fn target_merge_budget(cfg: &TrainerConfig) -> usize {
-    let base_vocab = 256usize + cfg.special_tokens.len();
+    let base_vocab = special_tokens::leading_tokens().len() + 256usize + cfg.special_tokens.len();
     cfg.target_vocab_size.saturating_sub(base_vocab)
 }
 
@@ -989,8 +1029,9 @@ fn run_train(args: TrainArgs) -> Result<()> {
     if !args.allowed_lengths.is_empty() {
         cfg = cfg.allowed_token_lengths(args.allowed_lengths.clone());
     }
+    cfg = cfg.reasoning_tokens_enabled(!args.disable_reasoning_tokens);
     if !args.special_tokens.is_empty() {
-        cfg = cfg.special_tokens(args.special_tokens.clone());
+        cfg = cfg.append_special_tokens(args.special_tokens.clone());
     }
     if args.plateau_floor.is_some()
         || args.plateau_patience.is_some()
@@ -1011,6 +1052,9 @@ fn run_train(args: TrainArgs) -> Result<()> {
         args.preprocessor
             .into_config(args.preprocessor_probability, args.preprocessor_seed),
     );
+    cfg = cfg
+        .require_letter_whitespace_merges(args.whitespace_merges_require_letter)
+        .forbid_leading_whitespace_merges(args.forbid_leading_whitespace_merges);
     let trainer_cfg = cfg.build()?;
 
     let ingest_cfg = IngestConfig {
@@ -1135,6 +1179,13 @@ fn run_train(args: TrainArgs) -> Result<()> {
         0.0
     };
 
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+
     artifacts
         .model
         .save_huggingface(&args.output)
@@ -1203,14 +1254,17 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
     if !args.allowed_lengths.is_empty() {
         cfg = cfg.allowed_token_lengths(args.allowed_lengths.clone());
     }
+    cfg = cfg.reasoning_tokens_enabled(!args.disable_reasoning_tokens);
     if !args.special_tokens.is_empty() {
-        cfg = cfg.special_tokens(args.special_tokens.clone());
+        cfg = cfg.append_special_tokens(args.special_tokens.clone());
     }
     cfg = cfg
         .preprocessor(
             args.preprocessor
                 .into_config(args.preprocessor_probability, args.preprocessor_seed),
         )
+        .require_letter_whitespace_merges(args.whitespace_merges_require_letter)
+        .forbid_leading_whitespace_merges(args.forbid_leading_whitespace_merges)
         .max_merge_iterations(args.max_merge_iterations)
         .show_progress(false)
         .plateau_stop_enabled(false);
@@ -1838,7 +1892,7 @@ fn run_info(args: InfoArgs) -> Result<()> {
     let parsed: TokenizerFile =
         serde_json::from_str(&data).context("failed to parse tokenizer.json")?;
 
-    let vocab_size = parsed.model.vocab.len();
+    let total_vocab = parsed.model.vocab.len();
     let merges = parsed.model.merges.len();
     let special_tokens = parsed
         .added_tokens
@@ -1846,10 +1900,14 @@ fn run_info(args: InfoArgs) -> Result<()> {
         .filter(|token| token.special)
         .map(|token| token.content.clone())
         .collect::<Vec<_>>();
+    let special_count = special_tokens.len();
+    let base_vocab = total_vocab.saturating_sub(special_count);
     let summary = json!({
         "path": args.tokenizer.display().to_string(),
         "model_type": parsed.model.kind,
-        "vocab_size": vocab_size,
+        "base_vocab_size": base_vocab,
+        "special_vocab_size": special_count,
+        "total_vocab_size": total_vocab,
         "merges": merges,
         "byte_fallback": parsed.model.byte_fallback,
         "special_tokens": special_tokens,
@@ -1861,7 +1919,9 @@ fn run_info(args: InfoArgs) -> Result<()> {
         let model_type = summary["model_type"].as_str().unwrap_or("unknown");
         let byte_fallback = parsed.model.byte_fallback;
         println!("Model type   : {model_type}");
-        println!("Vocab size   : {vocab_size}");
+        println!("Base vocab   : {base_vocab}");
+        println!("Specials     : {special_count}");
+        println!("Total vocab  : {total_vocab}");
         println!("Merges       : {merges}");
         println!("Byte fallback: {byte_fallback}");
         if summary["special_tokens"].is_array()

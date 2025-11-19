@@ -1,8 +1,10 @@
 //! Configuration builders controlling training and corpus ingestion.
 
+use std::collections::HashSet;
 use std::convert::TryFrom;
 
 use crate::error::{BbpeError, Result};
+use crate::special_tokens;
 use serde::{Deserialize, Serialize};
 
 /// Preprocessing mode applied before BPE training.
@@ -77,6 +79,12 @@ pub struct TrainerConfig {
     pub plateau_stop_enabled: bool,
     /// Optional preprocessing performed before counting merges.
     pub preprocessor: PreprocessorConfig,
+    /// Require ASCII letters when merges produce whitespace-containing tokens.
+    #[serde(default)]
+    pub require_letter_whitespace_merges: bool,
+    /// Forbid merges whose tokens begin with ASCII whitespace unless the token is pure whitespace.
+    #[serde(default)]
+    pub forbid_leading_whitespace_merges: bool,
 }
 
 impl TrainerConfig {
@@ -89,10 +97,13 @@ impl TrainerConfig {
     /// Validates the invariants required for training.
     pub fn validate(&self) -> Result<()> {
         self.preprocessor.validate()?;
-        if self.target_vocab_size < 256 + self.special_tokens.len() {
+        let leading_specials = special_tokens::leading_tokens().len();
+        let min_vocab = leading_specials + 256 + self.special_tokens.len();
+        if self.target_vocab_size < min_vocab {
             return Err(BbpeError::InvalidConfig(format!(
-                "target_vocab_size ({}) must be at least 256 + special tokens ({}).",
+                "target_vocab_size ({}) must be at least {} (leading specials + 256 byte tokens + trailing specials {}).",
                 self.target_vocab_size,
+                min_vocab,
                 self.special_tokens.len()
             )));
         }
@@ -139,29 +150,41 @@ impl Default for TrainerConfig {
             min_frequency: 4,
             allowed_token_lengths: (1..=32).collect(),
             show_progress: true,
-            special_tokens: vec![
-                "<|start|>".into(),
-                "<|end|>".into(),
-                "<|pad|>".into(),
-                "<|unk|>".into(),
-                "<|cls|>".into(),
-                "<|sep|>".into(),
-                "<|mask|>".into(),
-            ],
+            special_tokens: special_tokens::reasoning_tokens().to_vec(),
             plateau_frequency_floor: 128,
             plateau_patience: 32,
             plateau_frequency_divisor: 512,
             max_merge_iterations: None,
             plateau_stop_enabled: false,
             preprocessor: PreprocessorConfig::default(),
+            require_letter_whitespace_merges: false,
+            forbid_leading_whitespace_merges: false,
         }
     }
 }
 
 /// Builder for [`TrainerConfig`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct TrainerBuilder {
     cfg: TrainerConfig,
+    allowed_lengths_overridden: bool,
+    reasoning_tokens_enabled: bool,
+    special_tokens_overridden: bool,
+    appended_special_tokens: Vec<String>,
+}
+
+impl Default for TrainerBuilder {
+    fn default() -> Self {
+        let mut cfg = TrainerConfig::default();
+        cfg.special_tokens.clear();
+        Self {
+            cfg,
+            allowed_lengths_overridden: false,
+            reasoning_tokens_enabled: true,
+            special_tokens_overridden: false,
+            appended_special_tokens: Vec::new(),
+        }
+    }
 }
 
 impl TrainerBuilder {
@@ -192,6 +215,7 @@ impl TrainerBuilder {
         I: IntoIterator<Item = usize>,
     {
         self.cfg.allowed_token_lengths = lengths.into_iter().collect();
+        self.allowed_lengths_overridden = true;
         self
     }
 
@@ -202,14 +226,27 @@ impl TrainerBuilder {
         self
     }
 
-    /// Overrides the set of special tokens appended to the vocabulary.
+    /// Appends custom special tokens after the built-in required tokens.
     #[must_use]
     pub fn special_tokens<I, S>(mut self, tokens: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        self.special_tokens_overridden = true;
         self.cfg.special_tokens = tokens.into_iter().map(|s| s.into()).collect();
+        self
+    }
+
+    /// Appends additional special tokens after the reasoning set (preserves order, deduplicated in build).
+    #[must_use]
+    pub fn append_special_tokens<I, S>(mut self, tokens: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.appended_special_tokens
+            .extend(tokens.into_iter().map(|s| s.into()));
         self
     }
 
@@ -243,6 +280,27 @@ impl TrainerBuilder {
         self
     }
 
+    /// Enforces that whitespace-containing merges include ASCII letters when enabled.
+    #[must_use]
+    pub fn require_letter_whitespace_merges(mut self, enabled: bool) -> Self {
+        self.cfg.require_letter_whitespace_merges = enabled;
+        self
+    }
+
+    /// Forbids merges that would introduce leading ASCII whitespace unless the token is pure whitespace.
+    #[must_use]
+    pub fn forbid_leading_whitespace_merges(mut self, enabled: bool) -> Self {
+        self.cfg.forbid_leading_whitespace_merges = enabled;
+        self
+    }
+
+    /// Enables or disables the optional reasoning/argument special tokens.
+    #[must_use]
+    pub fn reasoning_tokens_enabled(mut self, enabled: bool) -> Self {
+        self.reasoning_tokens_enabled = enabled;
+        self
+    }
+
     /// Overrides only the preprocessor split probability.
     #[must_use]
     pub fn preprocessor_split_probability(mut self, probability: f64) -> Self {
@@ -259,8 +317,36 @@ impl TrainerBuilder {
 
     /// Finalises the builder, returning a validated [`TrainerConfig`].
     pub fn build(mut self) -> Result<TrainerConfig> {
+        if !self.allowed_lengths_overridden {
+            match self.cfg.preprocessor.kind {
+                PreprocessorKind::AsciiWhitespace | PreprocessorKind::UnicodeWhitespace => {
+                    self.cfg.allowed_token_lengths = (1..=16).collect();
+                }
+                _ => {}
+            }
+        }
         self.cfg.allowed_token_lengths.sort_unstable();
         self.cfg.allowed_token_lengths.dedup();
+        let mut trailing = if self.special_tokens_overridden {
+            std::mem::take(&mut self.cfg.special_tokens)
+        } else {
+            let mut tokens = if self.reasoning_tokens_enabled {
+                special_tokens::reasoning_tokens().to_vec()
+            } else {
+                Vec::new()
+            };
+            let leading: HashSet<String> =
+                special_tokens::leading_tokens().iter().cloned().collect();
+            tokens.extend(
+                self.appended_special_tokens
+                    .iter()
+                    .filter(|token| !leading.contains(token.as_str()))
+                    .cloned(),
+            );
+            tokens
+        };
+        special_tokens::dedup_in_place(&mut trailing);
+        self.cfg.special_tokens = trailing;
         self.cfg.validate()?;
         Ok(self.cfg)
     }
@@ -347,6 +433,34 @@ mod tests {
             .build()
             .expect("config should be valid");
         assert_eq!(&cfg.allowed_token_lengths, &[1, 2, 4]);
+    }
+
+    #[test]
+    fn ascii_preprocessor_shrinks_default_allowed_lengths() {
+        let cfg = TrainerConfig::builder()
+            .preprocessor(PreprocessorConfig {
+                kind: PreprocessorKind::AsciiWhitespace,
+                split_probability: 1.0,
+                seed: None,
+            })
+            .build()
+            .expect("config build");
+        assert_eq!(cfg.allowed_token_lengths.first(), Some(&1));
+        assert_eq!(cfg.allowed_token_lengths.last(), Some(&16));
+    }
+
+    #[test]
+    fn custom_allowed_lengths_are_preserved() {
+        let cfg = TrainerConfig::builder()
+            .allowed_token_lengths([1, 4, 24, 32])
+            .preprocessor(PreprocessorConfig {
+                kind: PreprocessorKind::AsciiWhitespace,
+                split_probability: 1.0,
+                seed: None,
+            })
+            .build()
+            .expect("config build");
+        assert_eq!(cfg.allowed_token_lengths, vec![1, 4, 24, 32]);
     }
 
     #[test]

@@ -7,3 +7,4 @@
 /target/package/
 # Local scratch data sets
 /test_data/
+test.jsonl.gz

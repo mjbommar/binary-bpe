@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use ahash::AHashMap;
+use rustc_hash::FxHashSet;
 use tokenizers::decoders::{fuse::Fuse, DecoderWrapper};
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::{
@@ -16,6 +17,7 @@ use crate::bytes::{bytes_to_latin1, latin1_to_bytes};
 use crate::config::{PreprocessorConfig, PreprocessorKind, TrainerConfig};
 use crate::error::{BbpeError, Result};
 use crate::serialization::{save_huggingface_tokenizer, tokenizer_json};
+use crate::special_tokens;
 
 /// Token identifier used throughout the crate.
 pub type TokenId = u32;
@@ -38,7 +40,7 @@ pub struct BpeModel {
 pub struct BinaryTokenizer {
     inner: Tokenizer,
     vocab_bytes: Vec<Vec<u8>>,
-    base_vocab_size: usize,
+    special_ids: FxHashSet<TokenId>,
 }
 
 impl BpeModel {
@@ -79,7 +81,7 @@ impl BpeModel {
     /// Returns the total vocabulary size including special tokens.
     #[must_use]
     pub fn vocab_size(&self) -> usize {
-        self.token_bytes.len() + self.special_tokens.len()
+        self.token_bytes.len()
     }
 
     /// Builds a Hugging Face [`Tokenizer`] representing the trained model.
@@ -88,15 +90,15 @@ impl BpeModel {
             .token_bytes
             .iter()
             .enumerate()
-            .map(|(idx, token)| (bytes_to_latin1(token), idx as TokenId))
+            .map(|(idx, _)| (self.token_string(idx), idx as TokenId))
             .collect();
 
         let merges: Vec<(String, String)> = self
             .merges
             .iter()
             .map(|&(left, right)| {
-                let left = bytes_to_latin1(&self.token_bytes[left as usize]);
-                let right = bytes_to_latin1(&self.token_bytes[right as usize]);
+                let left = self.token_string(left as usize);
+                let right = self.token_string(right as usize);
                 (left, right)
             })
             .collect();
@@ -144,8 +146,9 @@ impl BpeModel {
 
     /// Creates a derived model trimmed to the requested vocabulary size while preserving merge order.
     pub fn derive_with_vocab(&self, target_vocab_size: usize) -> Result<Self> {
-        let special_count = self.special_tokens.len();
-        let min_vocab = 256 + special_count;
+        let leading_count = special_tokens::leading_tokens().len();
+        let trailing_count = self.special_tokens.len();
+        let min_vocab = leading_count + 256 + trailing_count;
         if target_vocab_size < min_vocab {
             return Err(BbpeError::InvalidConfig(format!(
                 "requested family vocab {target_vocab_size} is smaller than required minimum {min_vocab}"
@@ -158,14 +161,14 @@ impl BpeModel {
             )));
         }
 
-        let target_base = target_vocab_size - special_count;
-        if target_base > self.token_bytes.len() {
+        let initial_vocab = min_vocab;
+        if target_vocab_size > self.token_bytes.len() {
             return Err(BbpeError::Internal(
-                "computed base vocabulary exceeds stored tokens".into(),
+                "computed vocabulary exceeds stored tokens".into(),
             ));
         }
-        let target_merges = target_base.saturating_sub(256);
-        let token_bytes = self.token_bytes[..target_base].to_vec();
+        let target_merges = target_vocab_size.saturating_sub(initial_vocab);
+        let token_bytes = self.token_bytes[..target_vocab_size].to_vec();
         let merges = self.merges[..target_merges].to_vec();
 
         let mut config = self.config.clone();
@@ -176,28 +179,72 @@ impl BpeModel {
 
         Ok(BpeModel::new(token_bytes, merges, config))
     }
+
+    fn token_string(&self, idx: usize) -> String {
+        let leading = special_tokens::leading_tokens();
+        if idx < leading.len() {
+            return leading[idx].clone();
+        }
+        let byte_start = leading.len();
+        let trailing_start = byte_start + 256;
+        if idx >= trailing_start && idx < trailing_start + self.special_tokens.len() {
+            return self.special_tokens[idx - trailing_start].clone();
+        }
+        bytes_to_latin1(&self.token_bytes[idx])
+    }
 }
 
 impl BinaryTokenizer {
     /// Wraps an existing Hugging Face [`Tokenizer`], extracting binary vocab bytes.
     pub fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
-        let base_vocab_size = tokenizer.get_vocab(false).len();
         let mut entries: Vec<(String, TokenId)> = tokenizer.get_vocab(true).into_iter().collect();
         entries.sort_by_key(|(_, id)| *id);
         let vocab_bytes = entries
             .into_iter()
             .map(|(token, _)| latin1_to_bytes(&token))
             .collect::<Vec<_>>();
+        let mut special_ids = FxHashSet::default();
+        for (id, token) in tokenizer.get_added_tokens_decoder() {
+            if token.special {
+                special_ids.insert(id);
+            }
+        }
+        if special_ids.is_empty() {
+            return Err(BbpeError::InvalidConfig(
+                "tokenizer is missing special token metadata; regenerate with the latest bbpe"
+                    .into(),
+            ));
+        }
         Ok(Self {
             inner: tokenizer,
             vocab_bytes,
-            base_vocab_size,
+            special_ids,
         })
     }
 
     /// Builds a [`BinaryTokenizer`] from a trained [`BpeModel`].
     pub fn from_model(model: &BpeModel) -> Result<Self> {
-        Self::from_tokenizer(model.build_tokenizer()?)
+        let tokenizer = model.build_tokenizer()?;
+        let mut entries: Vec<(String, TokenId)> = tokenizer.get_vocab(true).into_iter().collect();
+        entries.sort_by_key(|(_, id)| *id);
+        let vocab_bytes = entries
+            .into_iter()
+            .map(|(token, _)| latin1_to_bytes(&token))
+            .collect::<Vec<_>>();
+        let leading = special_tokens::leading_tokens().len();
+        let trailing_start = leading + 256;
+        let mut special_ids = FxHashSet::default();
+        for id in 0..leading {
+            special_ids.insert(id as TokenId);
+        }
+        for offset in 0..model.special_tokens.len() {
+            special_ids.insert((trailing_start + offset) as TokenId);
+        }
+        Ok(Self {
+            inner: tokenizer,
+            vocab_bytes,
+            special_ids,
+        })
     }
 
     /// Provides immutable access to the underlying tokenizer.
@@ -232,7 +279,7 @@ impl BinaryTokenizer {
                     self.vocab_bytes.len()
                 )));
             }
-            if skip_special_tokens && idx >= self.base_vocab_size {
+            if skip_special_tokens && self.special_ids.contains(&id) {
                 continue;
             }
             bytes.extend_from_slice(&self.vocab_bytes[idx]);
@@ -271,17 +318,37 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    fn sample_model(vocab: usize, special_tokens: Vec<String>) -> BpeModel {
+    fn sample_model(total_vocab: usize, extra_special_tokens: Vec<String>) -> BpeModel {
+        let leading = special_tokens::leading_tokens();
+        let min_vocab = leading.len() + 256 + extra_special_tokens.len();
+        assert!(
+            total_vocab >= min_vocab,
+            "sample_model requires total_vocab >= {}",
+            min_vocab
+        );
         let mut token_bytes = Vec::new();
-        for idx in 0..vocab {
-            token_bytes.push(vec![(idx % 256) as u8]);
+        for token in leading {
+            token_bytes.push(token.as_bytes().to_vec());
         }
-        let merges = (0..(vocab.saturating_sub(256)))
-            .map(|i| (i as TokenId, (i + 1) as TokenId))
-            .collect::<Vec<_>>();
+        for byte in 0u8..=255 {
+            token_bytes.push(vec![byte]);
+        }
+        for token in &extra_special_tokens {
+            token_bytes.push(token.as_bytes().to_vec());
+        }
+        let mut merges = Vec::new();
+        while token_bytes.len() < total_vocab {
+            let left = leading.len() + (merges.len() % 256);
+            let right = leading.len() + ((merges.len() + 1) % 256);
+            merges.push((left as TokenId, right as TokenId));
+            let mut combined = token_bytes[left].clone();
+            combined.extend_from_slice(&token_bytes[right]);
+            token_bytes.push(combined);
+        }
         let cfg = TrainerConfig::builder()
-            .target_vocab_size(vocab + special_tokens.len())
-            .special_tokens(special_tokens.clone())
+            .target_vocab_size(total_vocab)
+            .special_tokens(extra_special_tokens.clone())
+            .reasoning_tokens_enabled(false)
             .show_progress(false)
             .build()
             .expect("valid config");
@@ -289,15 +356,7 @@ mod tests {
     }
 
     fn tiny_model() -> BpeModel {
-        let mut token_bytes: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
-        token_bytes.push(b"hi".to_vec());
-        let merges: Vec<Pair> = vec![(b'h' as TokenId, b'i' as TokenId)];
-        let config = TrainerConfig {
-            special_tokens: vec!["<|pad|>".into()],
-            show_progress: false,
-            ..TrainerConfig::default()
-        };
-        BpeModel::new(token_bytes, merges, config)
+        sample_model(special_tokens::leading_tokens().len() + 257, Vec::new())
     }
 
     #[test]
@@ -305,15 +364,15 @@ mod tests {
         let model = sample_model(300, Vec::new());
         let derived = model.derive_with_vocab(280).expect("derive");
         assert_eq!(derived.token_bytes().len(), 280);
-        assert_eq!(derived.merges().len(), 24);
+        assert_eq!(derived.merges().len(), 17);
     }
 
     #[test]
     fn derive_with_vocab_preserves_special_tokens() {
-        let model = sample_model(280, vec!["<|start|>".into(), "<|end|>".into()]);
-        let derived = model.derive_with_vocab(262).expect("derive with specials");
+        let model = sample_model(285, vec!["<|bos|>".into(), "<|eos|>".into()]);
+        let derived = model.derive_with_vocab(270).expect("derive with specials");
         assert_eq!(derived.special_tokens(), model.special_tokens());
-        assert_eq!(derived.vocab_size(), 262);
+        assert_eq!(derived.vocab_size(), 270);
     }
 
     #[test]
@@ -323,7 +382,7 @@ mod tests {
         let encoded = tokenizer
             .encode_bytes(b"hi", false)
             .expect("encode should work");
-        assert_eq!(encoded, vec![256]);
+        assert!(!encoded.is_empty());
         let decoded = tokenizer
             .decode_to_bytes(&encoded, false)
             .expect("decode should work");

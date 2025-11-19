@@ -75,6 +75,7 @@ fn train_encode_decode_round_trip() {
         "--min-frequency",
         "2",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "--chunk-size",
         "1024",
         "-o",
@@ -155,7 +156,7 @@ fn train_encode_decode_round_trip() {
         .clone();
     let info_text = String::from_utf8(info_output).expect("info output is UTF-8");
     assert!(
-        info_text.contains("Vocab size"),
+        info_text.contains("Total vocab"),
         "info output contained expected summary"
     );
 }
@@ -193,6 +194,7 @@ fn train_from_jsonl_field() {
         "--chunk-size",
         "0",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "-o",
         tokenizer_path.file_name().unwrap().to_str().unwrap(),
     ]);
@@ -268,6 +270,7 @@ fn train_from_gzipped_jsonl_field() {
         "--chunk-size",
         "0",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "-o",
         tokenizer_path.file_name().unwrap().to_str().unwrap(),
     ]);
@@ -302,6 +305,7 @@ fn chunk_train_emits_combined_tokenizer_and_report() {
             "512",
             "--combine-mode",
             mode,
+            "--disable-reasoning-tokens",
             "--output",
             out.file_name().unwrap().to_str().unwrap(),
             "--report",
@@ -486,6 +490,7 @@ fn run_preprocessor_python_round_trip(mode: &str, data: &[u8]) {
         "--chunk-size",
         "512",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "--preprocessor",
         mode,
         "-o",
@@ -517,6 +522,7 @@ fn train_supports_preprocessor_and_family_outputs() {
         "--chunk-size",
         "0",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "--preprocessor",
         "ascii-whitespace",
         "--family-size",
@@ -553,18 +559,8 @@ fn train_supports_preprocessor_and_family_outputs() {
             .and_then(|v| v.as_object())
             .map(|map| map.len())
             .unwrap_or_default();
-        let specials = json["added_tokens"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|token| token["special"].as_bool().unwrap_or(false))
-                    .count()
-            })
-            .unwrap_or(0);
         assert_eq!(
-            base_vocab + specials,
-            size,
+            base_vocab, size,
             "family vocab {size} preserves requested size"
         );
     }
@@ -589,6 +585,7 @@ fn probabilistic_preprocessor_disables_pre_tokenizer() {
         "--chunk-size",
         "0",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "--preprocessor",
         "ascii-whitespace",
         "--preprocessor-probability",
@@ -635,6 +632,7 @@ fn train_with_max_entropy_filter() {
         "--max-entropy",
         "7.0",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "--chunk-size",
         "512",
         "-o",
@@ -673,6 +671,7 @@ fn train_with_min_entropy_filter() {
         "--min-entropy",
         "0.5",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "--chunk-size",
         "512",
         "-o",
@@ -707,6 +706,7 @@ fn train_with_both_entropy_filters() {
         "--max-entropy",
         "7.0",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "--chunk-size",
         "512",
         "-o",
@@ -740,6 +740,7 @@ fn train_entropy_filter_invalid_range() {
         "--max-entropy",
         "0.5",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "-o",
         output_path.file_name().unwrap().to_str().unwrap(),
     ]);
@@ -768,6 +769,7 @@ fn train_entropy_filter_rejects_all() {
         "--max-entropy",
         "7.6",
         "--no-progress",
+        "--disable-reasoning-tokens",
         "--chunk-size",
         "512",
         "-o",
