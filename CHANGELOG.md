@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+- _Nothing yet._
+
+## 0.6.2 - 2025-11-21
 - Ensured every Hugging Face export wraps the trained model with a ByteLevel pre-tokenizer/decoder, preserving non-ASCII bytes (CJK, emoji, reasoning glyphs, etc.) even when downstream tokenizers are run outside of `bbpe`.
 - Reworked serialization to use the GPT-2 byte alphabet end-to-end, teaching `BinaryTokenizer` to detect existing ByteLevel decoders and strip them when round-tripping so legacy Latin-1 artefacts keep working.
 - Moved the Category 4 reasoning/argumentation tokens into the fixed base vocabulary (immediately after the 256-byte alphabet) instead of marking them as specials, preventing Hugging Face from stripping them during decode while keeping the CLI toggles intact.
