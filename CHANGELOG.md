@@ -3,6 +3,12 @@
 ## Unreleased
 - _Nothing yet._
 
+## 0.6.1 - 2025-11-21
+- Added an incremental preprocessing pipeline (`PreprocessorRunner`) plus the new `SequenceStream`/`Trainer::train_from_stream` APIs so callers can normalize, tokenize, and aggregate corpora chunk-by-chunk without staging every sequence in memory.
+- Introduced `stream_jsonl_corpus` alongside the existing binary chunk iterator, enabling both binary and JSONL sources to feed the streaming trainer directly (with optional length hints for progress reporting).
+- Implemented a lightweight pair-cache cap that prunes the low-frequency frontier after each merge, keeping `pair_counts`, `pair_positions`, and the candidate heap bounded even on massive datasets.
+- Refreshed the README with streaming examples, updated installation instructions (`cargo add bbpe@0.6.1`), and documented the `uv run --with tokenizers ...` sanity check; ran the command during release prep to confirm Hugging Face round-trips still pass.
+
 ## 0.6.0 - 2025-11-19
 - Locked the Category 3 specials (`<|start|>` … `<|mask|>`) to token IDs 0–6 across every model via the new `references/special_tokens.json`, guaranteeing deterministic layouts for both the CLI and the library.
 - Inserted the full set of Category 4 reasoning tokens immediately after the 256-byte alphabet, enabled by default but controllable through `--disable-reasoning-tokens` / `TrainerBuilder::reasoning_tokens_enabled(false)`; extra custom specials are now appended without disturbing the reserved slots.

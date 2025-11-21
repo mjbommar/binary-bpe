@@ -163,46 +163,8 @@ pub fn load_jsonl_corpus(specs: &[JsonlSpec]) -> Result<Vec<Vec<u8>>> {
         return Ok(Vec::new());
     }
 
-    let mut sequences = Vec::new();
-    for spec in specs {
-        let reader = open_jsonl_reader(&spec.path)?;
-        for (line_idx, line) in reader.lines().enumerate() {
-            let line = line.map_err(|err| BbpeError::io(err, Some(spec.path.clone())))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value: Value = serde_json::from_str(&line).map_err(|err| {
-                BbpeError::InvalidConfig(format!(
-                    "failed to parse JSON in {} on line {}: {err}",
-                    spec.path.display(),
-                    line_idx + 1
-                ))
-            })?;
-            let mut current = &value;
-            for key in &spec.field_path {
-                current = current.get(key).ok_or_else(|| {
-                    BbpeError::InvalidConfig(format!(
-                        "field `{}` missing in {} on line {}",
-                        spec.field_path.join("."),
-                        spec.path.display(),
-                        line_idx + 1
-                    ))
-                })?;
-            }
-            let text = current.as_str().ok_or_else(|| {
-                BbpeError::InvalidConfig(format!(
-                    "field `{}` in {} line {} is not a string",
-                    spec.field_path.join("."),
-                    spec.path.display(),
-                    line_idx + 1
-                ))
-            })?;
-            if !text.is_empty() {
-                sequences.push(text.as_bytes().to_vec());
-            }
-        }
-    }
-
+    let sequences: Result<Vec<Vec<u8>>> = stream_jsonl_corpus(specs)?.collect();
+    let sequences = sequences?;
     if sequences.is_empty() {
         return Err(BbpeError::InvalidConfig(
             "no sequences extracted from JSONL inputs".into(),
@@ -211,7 +173,7 @@ pub fn load_jsonl_corpus(specs: &[JsonlSpec]) -> Result<Vec<Vec<u8>>> {
     Ok(sequences)
 }
 
-fn open_jsonl_reader(path: &Path) -> Result<Box<dyn BufRead>> {
+fn open_jsonl_reader(path: &Path) -> Result<Box<dyn BufRead + Send>> {
     let file = File::open(path).map_err(|err| BbpeError::io(err, Some(path.to_path_buf())))?;
     if is_gzip_path(path) {
         let decoder = MultiGzDecoder::new(file);
@@ -393,6 +355,127 @@ impl Iterator for BinaryChunkStream {
     }
 }
 
+/// Streams records from JSONL files, yielding extracted byte sequences without buffering everything.
+pub fn stream_jsonl_corpus(specs: &[JsonlSpec]) -> Result<JsonlStream> {
+    Ok(JsonlStream::new(specs.to_vec()))
+}
+
+/// Iterator over JSONL records that extracts the configured nested field per line.
+pub struct JsonlStream {
+    specs: Vec<JsonlSpec>,
+    current_index: usize,
+    reader: Option<Box<dyn BufRead + Send>>,
+    buffer: String,
+    line_index: usize,
+}
+
+impl JsonlStream {
+    fn new(specs: Vec<JsonlSpec>) -> Self {
+        Self {
+            specs,
+            current_index: 0,
+            reader: None,
+            buffer: String::new(),
+            line_index: 0,
+        }
+    }
+}
+
+impl Iterator for JsonlStream {
+    type Item = Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current_index >= self.specs.len() {
+                return None;
+            }
+
+            if self.reader.is_none() {
+                let spec = &self.specs[self.current_index];
+                match open_jsonl_reader(&spec.path) {
+                    Ok(reader) => {
+                        self.reader = Some(reader);
+                        self.line_index = 0;
+                    }
+                    Err(err) => {
+                        self.current_index = self.current_index.saturating_add(1);
+                        return Some(Err(err));
+                    }
+                }
+            }
+
+            let spec = &self.specs[self.current_index];
+            let reader = self
+                .reader
+                .as_mut()
+                .expect("reader should be initialised before reading");
+            self.buffer.clear();
+            match reader.read_line(&mut self.buffer) {
+                Ok(0) => {
+                    self.reader = None;
+                    self.line_index = 0;
+                    self.current_index = self.current_index.saturating_add(1);
+                    continue;
+                }
+                Ok(_) => {
+                    self.line_index = self.line_index.saturating_add(1);
+                    if self.buffer.trim().is_empty() {
+                        continue;
+                    }
+                    match parse_jsonl_line(&self.buffer, spec, self.line_index) {
+                        Ok(Some(bytes)) => return Some(Ok(bytes)),
+                        Ok(None) => continue,
+                        Err(err) => {
+                            self.reader = None;
+                            self.current_index = self.current_index.saturating_add(1);
+                            return Some(Err(err));
+                        }
+                    }
+                }
+                Err(err) => {
+                    let path = spec.path.clone();
+                    self.reader = None;
+                    self.current_index = self.current_index.saturating_add(1);
+                    return Some(Err(BbpeError::io(err, Some(path))));
+                }
+            }
+        }
+    }
+}
+
+fn parse_jsonl_line(line: &str, spec: &JsonlSpec, line_idx: usize) -> Result<Option<Vec<u8>>> {
+    let value: Value = serde_json::from_str(line).map_err(|err| {
+        BbpeError::InvalidConfig(format!(
+            "failed to parse JSON in {} on line {}: {err}",
+            spec.path.display(),
+            line_idx
+        ))
+    })?;
+    let mut current = &value;
+    for key in &spec.field_path {
+        current = current.get(key).ok_or_else(|| {
+            BbpeError::InvalidConfig(format!(
+                "field `{}` missing in {} on line {}",
+                spec.field_path.join("."),
+                spec.path.display(),
+                line_idx
+            ))
+        })?;
+    }
+    let text = current.as_str().ok_or_else(|| {
+        BbpeError::InvalidConfig(format!(
+            "field `{}` in {} line {} is not a string",
+            spec.field_path.join("."),
+            spec.path.display(),
+            line_idx
+        ))
+    })?;
+    if text.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(text.as_bytes().to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +559,30 @@ mod tests {
             .map(|item| item.expect("stream item"))
             .collect::<Vec<_>>();
         assert_eq!(streamed, expected);
+    }
+
+    #[test]
+    fn stream_jsonl_corpus_matches_loader() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("data.jsonl");
+        let contents = r#"
+{"text":"alpha"}
+{"text":""}
+{"text":"beta gamma"}
+"#;
+        fs::write(&file, contents.trim()).expect("write jsonl");
+        let spec = JsonlSpec {
+            path: file.clone(),
+            field_path: vec!["text".to_string()],
+        };
+
+        let expected =
+            load_jsonl_corpus(std::slice::from_ref(&spec)).expect("load jsonl corpus eagerly");
+        assert_eq!(expected.len(), 2);
+
+        let streamed: Result<Vec<_>> = stream_jsonl_corpus(std::slice::from_ref(&spec))
+            .expect("build stream")
+            .collect();
+        assert_eq!(streamed.expect("collect stream"), expected);
     }
 }

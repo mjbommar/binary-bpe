@@ -323,8 +323,7 @@ mod tests {
         let min_vocab = leading.len() + 256 + extra_special_tokens.len();
         assert!(
             total_vocab >= min_vocab,
-            "sample_model requires total_vocab >= {}",
-            min_vocab
+            "sample_model requires total_vocab >= {min_vocab}"
         );
         let mut token_bytes = Vec::new();
         for token in leading {

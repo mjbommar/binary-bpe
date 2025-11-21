@@ -14,12 +14,15 @@ use crate::bytes::{
     is_ascii_whitespace, starts_with_ascii_whitespace,
 };
 use crate::config::{IngestConfig, TrainerBuilder, TrainerConfig};
-use crate::corpus::{load_binary_corpus, load_jsonl_corpus, JsonlSpec};
+use crate::corpus::{stream_binary_corpus, stream_jsonl_corpus, JsonlSpec};
 use crate::error::{BbpeError, Result};
 use crate::metrics::{sample_rss_kb, IterationMetrics, StopReason, TrainingMetrics};
 use crate::model::{BpeModel, Pair, TokenId};
-use crate::preprocess::apply_preprocessor;
+use crate::preprocess::PreprocessorRunner;
 use crate::special_tokens;
+
+const PAIR_CACHE_MULTIPLIER: usize = 32;
+const MIN_PAIR_CACHE: usize = 10_000;
 
 mod word;
 use word::Word;
@@ -38,6 +41,53 @@ pub struct TrainerArtifacts {
     pub model: BpeModel,
     /// Detailed metrics captured during training.
     pub metrics: TrainingMetrics,
+}
+
+/// Iterator wrapper that optionally tracks the total number of available sequences.
+pub struct SequenceStream<I> {
+    iter: I,
+    length_hint: Option<usize>,
+}
+
+impl<I> SequenceStream<I> {
+    /// Creates a stream without a known length.
+    #[must_use]
+    pub fn new(iter: I) -> Self {
+        Self {
+            iter,
+            length_hint: None,
+        }
+    }
+
+    /// Creates a stream with the provided exact length hint.
+    #[must_use]
+    pub fn with_length_hint(iter: I, length_hint: usize) -> Self {
+        Self {
+            iter,
+            length_hint: Some(length_hint),
+        }
+    }
+
+    /// Returns the optional length hint if one was provided.
+    #[must_use]
+    pub fn len_hint(&self) -> Option<usize> {
+        self.length_hint
+    }
+}
+
+impl<I> Iterator for SequenceStream<I>
+where
+    I: Iterator<Item = Result<Vec<u8>>>,
+{
+    type Item = Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
 }
 
 impl Trainer {
@@ -65,27 +115,34 @@ impl Trainer {
         inputs: &[P],
         ingest: &IngestConfig,
     ) -> Result<TrainerArtifacts> {
-        let sequences = load_binary_corpus(inputs, ingest)?;
-        self.train_from_sequences(sequences)
+        let chunk_stream = stream_binary_corpus(inputs, ingest)?;
+        let length_hint = chunk_stream.total_chunks();
+        let stream = SequenceStream::with_length_hint(chunk_stream, length_hint);
+        self.train_from_stream(stream)
     }
 
     /// Trains a model by extracting string fields from newline-delimited JSON (JSONL) files.
     pub fn train_from_jsonl(&self, specs: &[JsonlSpec]) -> Result<TrainerArtifacts> {
-        let sequences = load_jsonl_corpus(specs)?;
-        self.train_from_sequences(sequences)
+        let stream = stream_jsonl_corpus(specs)?;
+        self.train_from_stream(SequenceStream::new(stream))
     }
 
     /// Trains a model from in-memory byte sequences.
     pub fn train_from_sequences(&self, sequences: Vec<Vec<u8>>) -> Result<TrainerArtifacts> {
-        if sequences.is_empty() {
-            return Err(BbpeError::InvalidConfig(
-                "training requires at least one non-empty sequence".into(),
-            ));
-        }
+        let length = sequences.len();
+        let iter = sequences.into_iter().map(Ok::<_, BbpeError>);
+        self.train_from_stream(SequenceStream::with_length_hint(iter, length))
+    }
+
+    /// Streams byte sequences into the trainer without buffering the entire corpus.
+    pub fn train_from_stream<I>(&self, stream: SequenceStream<I>) -> Result<TrainerArtifacts>
+    where
+        I: Iterator<Item = Result<Vec<u8>>> + Send,
+    {
         self.cfg.validate()?;
+        let length_hint = stream.len_hint();
 
-        let preprocessed = apply_preprocessor(&self.cfg.preprocessor, &sequences);
-
+        let mut runner = PreprocessorRunner::new(self.cfg.preprocessor.clone());
         let leading_specials = special_tokens::leading_tokens();
         let trailing_specials = self.cfg.special_tokens.clone();
         let leading_count = leading_specials.len();
@@ -106,38 +163,48 @@ impl Trainer {
         let byte_offset =
             TokenId::try_from(leading_count).expect("leading special token count fits in TokenId");
 
-        let allowed_lengths = self.cfg.allowed_token_lengths.clone();
-        let aggregated_sequences: FxHashMap<Vec<TokenId>, u64> = {
-            let processed = preprocessed.as_slice();
-            if processed.is_empty() {
-                return Err(BbpeError::InvalidConfig(
-                    "preprocessing removed all sequences; adjust the preprocessor or provide non-empty spans"
-                        .into(),
-                ));
+        if self.cfg.show_progress {
+            if let Some(hint) = length_hint {
+                info!("streaming approximately {hint} corpus chunks");
+            } else {
+                info!("streaming corpus with unknown length");
             }
-            let mut map = FxHashMap::default();
-            for seq in processed {
-                if seq.is_empty() {
-                    continue;
+        }
+
+        let mut aggregated_sequences: FxHashMap<Vec<TokenId>, u64> = FxHashMap::default();
+        let mut observed_sequences = 0usize;
+
+        for chunk in stream {
+            let chunk = chunk?;
+            if chunk.is_empty() {
+                continue;
+            }
+            observed_sequences += 1;
+            runner.process(&chunk, |segment| {
+                let bytes = segment.as_ref();
+                if bytes.is_empty() {
+                    return;
                 }
-                let tokens: Vec<TokenId> = seq
+                let tokens: Vec<TokenId> = bytes
                     .iter()
                     .map(|&b| byte_offset + TokenId::from(b))
                     .collect();
-                *map.entry(tokens).or_insert(0) += 1;
-            }
-            map
-        };
+                *aggregated_sequences.entry(tokens).or_insert(0) += 1;
+            });
+        }
 
-        drop(preprocessed);
-        drop(sequences);
-
+        if observed_sequences == 0 {
+            return Err(BbpeError::InvalidConfig(
+                "training requires at least one non-empty sequence".into(),
+            ));
+        }
         if aggregated_sequences.is_empty() {
             return Err(BbpeError::InvalidConfig(
                 "training requires at least one non-empty sequence after preprocessing".into(),
             ));
         }
 
+        let allowed_lengths = self.cfg.allowed_token_lengths.clone();
         let mut token_bytes: Vec<Vec<u8>> = Vec::with_capacity(self.cfg.target_vocab_size);
         let mut token_lengths: Vec<usize> = Vec::with_capacity(self.cfg.target_vocab_size);
         for token in leading_specials {
@@ -174,6 +241,18 @@ impl Trainer {
                 heap.push(PairScore::new(pair, count));
             }
         }
+        let pair_cache_cap = self
+            .cfg
+            .target_vocab_size
+            .saturating_mul(PAIR_CACHE_MULTIPLIER)
+            .max(MIN_PAIR_CACHE);
+        prune_pair_cache(
+            &mut pair_counts,
+            &mut pair_positions,
+            &mut heap,
+            pair_cache_cap,
+            self.cfg.min_frequency,
+        );
 
         let mut iteration = 0usize;
         let mut metrics = TrainingMetrics::new(max_new_tokens.min(16_384));
@@ -306,6 +385,14 @@ impl Trainer {
                 rss_kb: sample_rss_kb(),
             };
             metrics.iterations.push(iteration_metrics);
+
+            prune_pair_cache(
+                &mut pair_counts,
+                &mut pair_positions,
+                &mut heap,
+                pair_cache_cap,
+                self.cfg.min_frequency,
+            );
         }
 
         if metrics.iterations.len() == max_new_tokens {
@@ -519,6 +606,35 @@ impl fmt::Display for TrainerArtifacts {
     }
 }
 
+fn prune_pair_cache(
+    pair_counts: &mut FxHashMap<Pair, usize>,
+    pair_positions: &mut FxHashMap<Pair, FxHashSet<usize>>,
+    heap: &mut BinaryHeap<PairScore>,
+    max_pairs: usize,
+    min_frequency: usize,
+) {
+    if pair_counts.len() <= max_pairs {
+        return;
+    }
+    let mut entries: Vec<(Pair, usize)> = pair_counts
+        .iter()
+        .filter(|(_, &count)| count >= min_frequency)
+        .map(|(pair, &count)| (*pair, count))
+        .collect();
+    if entries.len() <= max_pairs {
+        return;
+    }
+    entries.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(max_pairs);
+    let keep: FxHashSet<Pair> = entries.iter().map(|(pair, _)| *pair).collect();
+    pair_counts.retain(|pair, _| keep.contains(pair));
+    pair_positions.retain(|pair, _| keep.contains(pair));
+    heap.clear();
+    for (pair, freq) in entries {
+        heap.push(PairScore::new(pair, freq));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +669,19 @@ mod tests {
         let artefacts = trainer.train_from_sequences(sequences).unwrap();
         assert!(!artefacts.model.merges().is_empty());
         assert!(!artefacts.metrics.iterations.is_empty());
+    }
+
+    #[test]
+    fn trainer_streams_data_incrementally() {
+        let sequences = vec![
+            vec![0x01, 0x02, 0x01, 0x02],
+            vec![0x01, 0x02, 0x03, 0x04],
+            vec![0x02, 0x03, 0x02, 0x03],
+        ];
+        let trainer = trainer(2, 270);
+        let stream = SequenceStream::new(sequences.into_iter().map(Ok::<_, BbpeError>));
+        let artefacts = trainer.train_from_stream(stream).unwrap();
+        assert!(!artefacts.model.merges().is_empty());
     }
 
     #[test]
@@ -640,7 +769,7 @@ mod tests {
             }
             let starts_ws = token.first().copied().is_some_and(is_ascii_whitespace);
             if starts_ws && !is_all_ascii_whitespace(token) {
-                panic!("token {:?} should not start with whitespace", token);
+                panic!("token {token:?} should not start with whitespace");
             }
         }
     }

@@ -5,6 +5,7 @@ Binary-aware byte pair encoding (BPE) toolkit for Rust. `bbpe` trains Hugging Fa
 - **Binary-first**: Streams arbitrary bytes, honors null-delimited boundaries, and always exports true byte fallback Hugging Face models.
 - **Configurable preprocessing**: Deterministic ASCII/Unicode/null splitters or probabilistic boundary sampling to encourage multi-word merges.
 - **JSONL ingestion**: Point at `file.jsonl[:field.path]` (gzip optional) to train on textual corpora without pre-extracting files.
+- **Streaming-friendly trainer**: `BinaryChunkStream`, `stream_jsonl_corpus`, and `Trainer::train_from_stream` let you feed arbitrarily large corpora chunk-by-chunk, while the built-in pair-cache pruning keeps the merge frontier bounded in memory.
 - **Hierarchical vocabularies**: Train once at a large vocab, derive smaller siblings whose token IDs remain aligned.
 - **Chunked training**: Experimental `chunk-train` command allows ensemble-style training on arbitrarily large corpora.
 
@@ -15,7 +16,7 @@ Binary-aware byte pair encoding (BPE) toolkit for Rust. `bbpe` trains Hugging Fa
 cargo install bbpe
 
 # Add as a dependency (library only)
-cargo add bbpe@0.6.0
+cargo add bbpe@0.6.1
 ```
 
 For library-only usage without the CLI feature:
@@ -248,6 +249,29 @@ small.save_huggingface("tokenizer-2048.json")?;
 
 `Trainer::train_from_jsonl(&[JsonlSpec])` mirrors the CLI `--jsonl` behavior.
 
+### Streaming ingestion (library)
+
+When corpora are too large to materialize, combine the streaming helpers with the new `Trainer::train_from_stream` API:
+
+```rust
+use bbpe::corpus::{stream_binary_corpus, stream_jsonl_corpus, JsonlSpec};
+use bbpe::trainer::SequenceStream;
+
+let ingest_cfg = IngestConfig::default();
+let mut chunk_stream = stream_binary_corpus(&["firmware.bin"], &ingest_cfg)?;
+let chunk_hint = chunk_stream.total_chunks();
+let artifacts = trainer.train_from_stream(SequenceStream::with_length_hint(chunk_stream, chunk_hint))?;
+
+// JSONL works the same way (length hint optional).
+let jsonl_stream = stream_jsonl_corpus(&[JsonlSpec {
+    path: "docs.jsonl.gz".into(),
+    field_path: vec!["text".into()],
+}])?;
+let artifacts = trainer.train_from_stream(SequenceStream::new(jsonl_stream))?;
+```
+
+`SequenceStream` simply wraps any iterator that yields `Result<Vec<u8>>`, so you can plug in bespoke generators as long as they stream bytes.
+
 ## Python Interoperability
 
 All tokenizers are Hugging Face JSON artifacts:
@@ -264,6 +288,7 @@ print(encoding.ids)
 
 ```bash
 cargo fmt
+cargo check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 # Optional sanity check before publishing

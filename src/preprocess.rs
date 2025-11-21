@@ -1,5 +1,7 @@
 //! Preprocessing helpers that transform raw byte sequences before training.
 
+use std::borrow::Cow;
+
 use bstr::ByteSlice;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -27,6 +29,67 @@ impl<'a> PreprocessedSequences<'a> {
     }
 }
 
+/// Stateful helper that incrementally applies preprocessing to streaming sequences.
+#[derive(Debug)]
+pub struct PreprocessorRunner {
+    cfg: PreprocessorConfig,
+    rng: Option<StdRng>,
+    enabled: bool,
+}
+
+impl PreprocessorRunner {
+    /// Creates a new runner for the provided configuration.
+    #[must_use]
+    pub fn new(cfg: PreprocessorConfig) -> Self {
+        let enabled = !matches!(cfg.kind, PreprocessorKind::None) && cfg.split_probability > 0.0;
+        let rng = if enabled {
+            Some(match cfg.seed {
+                Some(seed) => StdRng::seed_from_u64(seed),
+                None => StdRng::from_entropy(),
+            })
+        } else {
+            None
+        };
+        Self { cfg, rng, enabled }
+    }
+
+    /// Returns true when preprocessing will emit new sequences instead of borrowing.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Processes a single sequence, invoking the supplied closure for each emitted chunk.
+    pub fn process<'a, F>(&'a mut self, sequence: &'a [u8], mut emit: F)
+    where
+        F: FnMut(Cow<'a, [u8]>),
+    {
+        if sequence.is_empty() {
+            return;
+        }
+        if !self.enabled {
+            emit(Cow::Borrowed(sequence));
+            return;
+        }
+        let rng = self
+            .rng
+            .as_mut()
+            .expect("runner should maintain RNG when enabled");
+        match self.cfg.kind {
+            PreprocessorKind::None => emit(Cow::Borrowed(sequence)),
+            PreprocessorKind::AsciiWhitespace => {
+                split_ascii_sequence(sequence, self.cfg.split_probability, rng, emit)
+            }
+            PreprocessorKind::UnicodeWhitespace => {
+                split_unicode_sequence(sequence, self.cfg.split_probability, rng, emit)
+            }
+            PreprocessorKind::NullDelimited => {
+                split_null_sequence(sequence, self.cfg.split_probability, rng, emit)
+            }
+        }
+    }
+}
+
 /// Applies the configured preprocessor to an input corpus, returning either a borrowed or owned
 /// slice of sequences depending on whether any transformation was required.
 #[must_use]
@@ -34,105 +97,101 @@ pub fn apply_preprocessor<'a>(
     cfg: &PreprocessorConfig,
     sequences: &'a [Vec<u8>],
 ) -> PreprocessedSequences<'a> {
-    let probability = cfg.split_probability.clamp(0.0, 1.0);
-    if matches!(cfg.kind, PreprocessorKind::None) || probability == 0.0 {
+    let mut runner = PreprocessorRunner::new(cfg.clone());
+    if !runner.is_enabled() {
         return PreprocessedSequences::Borrowed(sequences);
     }
 
-    let mut rng = match cfg.seed {
-        Some(seed) => StdRng::seed_from_u64(seed),
-        None => StdRng::from_entropy(),
-    };
-
-    match cfg.kind {
-        PreprocessorKind::None => PreprocessedSequences::Borrowed(sequences),
-        PreprocessorKind::AsciiWhitespace => {
-            PreprocessedSequences::Owned(split_ascii_sequences(sequences, probability, &mut rng))
-        }
-        PreprocessorKind::UnicodeWhitespace => {
-            PreprocessedSequences::Owned(split_unicode_sequences(sequences, probability, &mut rng))
-        }
-        PreprocessorKind::NullDelimited => {
-            PreprocessedSequences::Owned(split_null_delimited(sequences, probability, &mut rng))
-        }
+    let mut owned = Vec::new();
+    for seq in sequences {
+        runner.process(seq, |chunk| {
+            if chunk.is_empty() {
+                return;
+            }
+            owned.push(chunk.as_ref().to_vec());
+        });
     }
+    PreprocessedSequences::Owned(owned)
 }
 
-fn split_ascii_sequences<R: Rng + ?Sized>(
-    sequences: &[Vec<u8>],
-    probability: f64,
-    rng: &mut R,
-) -> Vec<Vec<u8>> {
+fn split_ascii_sequence<'a, R, F>(sequence: &'a [u8], probability: f64, rng: &mut R, emit: F)
+where
+    R: Rng + ?Sized,
+    F: FnMut(Cow<'a, [u8]>),
+{
     split_by_predicate(
-        sequences,
+        sequence,
         is_ascii_whitespace,
         probability,
         rng,
         SplitBehavior::Whitespace,
-    )
+        emit,
+    );
 }
 
-fn split_unicode_sequences<R: Rng + ?Sized>(
-    sequences: &[Vec<u8>],
-    probability: f64,
-    rng: &mut R,
-) -> Vec<Vec<u8>> {
-    let mut result = Vec::new();
-    for seq in sequences {
-        split_unicode_runs(seq, probability, rng, &mut result);
-    }
-    result
-}
-
-fn split_null_delimited<R: Rng + ?Sized>(
-    sequences: &[Vec<u8>],
-    probability: f64,
-    rng: &mut R,
-) -> Vec<Vec<u8>> {
-    split_by_predicate(
-        sequences,
-        |byte| byte == 0,
-        probability,
-        rng,
-        SplitBehavior::Generic,
-    )
-}
-
-fn split_by_predicate<R, F>(
-    sequences: &[Vec<u8>],
-    predicate: F,
-    probability: f64,
-    rng: &mut R,
-    behavior: SplitBehavior,
-) -> Vec<Vec<u8>>
+fn split_unicode_sequence<'a, R, F>(sequence: &'a [u8], probability: f64, rng: &mut R, emit: F)
 where
     R: Rng + ?Sized,
-    F: Fn(u8) -> bool + Copy,
-{
-    let mut result = Vec::new();
-    for seq in sequences {
-        split_runs(seq, predicate, probability, rng, behavior, &mut result);
-    }
-    result
-}
-
-type Segment = (usize, usize, bool);
-
-fn split_runs<R, F>(
-    sequence: &[u8],
-    predicate: F,
-    probability: f64,
-    rng: &mut R,
-    behavior: SplitBehavior,
-    out: &mut Vec<Vec<u8>>,
-) where
-    R: Rng + ?Sized,
-    F: Fn(u8) -> bool,
+    F: FnMut(Cow<'a, [u8]>),
 {
     if sequence.is_empty() {
         return;
     }
+    let segments = collect_unicode_segments(sequence);
+    merge_segments(
+        sequence,
+        segments,
+        probability,
+        rng,
+        SplitBehavior::Whitespace,
+        emit,
+    );
+}
+
+fn split_null_sequence<'a, R, F>(sequence: &'a [u8], probability: f64, rng: &mut R, emit: F)
+where
+    R: Rng + ?Sized,
+    F: FnMut(Cow<'a, [u8]>),
+{
+    split_by_predicate(
+        sequence,
+        |byte| byte == 0,
+        probability,
+        rng,
+        SplitBehavior::Generic,
+        emit,
+    );
+}
+
+fn split_by_predicate<'a, R, P, F>(
+    sequence: &'a [u8],
+    predicate: P,
+    probability: f64,
+    rng: &mut R,
+    behavior: SplitBehavior,
+    emit: F,
+) where
+    R: Rng + ?Sized,
+    P: Fn(u8) -> bool + Copy,
+    F: FnMut(Cow<'a, [u8]>),
+{
+    if sequence.is_empty() {
+        return;
+    }
+    let segments = collect_segments(sequence, predicate);
+    merge_segments(sequence, segments, probability, rng, behavior, emit);
+}
+
+type Segment = (usize, usize, bool);
+
+fn collect_segments<F>(sequence: &[u8], predicate: F) -> Vec<Segment>
+where
+    F: Fn(u8) -> bool,
+{
     let mut segments = Vec::new();
+    if sequence.is_empty() {
+        return segments;
+    }
     let mut start = 0usize;
     let mut current_kind = predicate(sequence[0]);
     for idx in 1..=sequence.len() {
@@ -141,29 +200,18 @@ fn split_runs<R, F>(
         } else {
             predicate(sequence[idx]) != current_kind
         };
-        if boundary {
-            if idx > start {
-                segments.push((start, idx, current_kind));
-            }
+        if boundary && idx > start {
+            segments.push((start, idx, current_kind));
             if idx < sequence.len() {
                 start = idx;
                 current_kind = predicate(sequence[idx]);
             }
         }
     }
-    merge_segments(sequence, segments, probability, rng, behavior, out);
+    segments
 }
 
-fn split_unicode_runs<R: Rng + ?Sized>(
-    sequence: &[u8],
-    probability: f64,
-    rng: &mut R,
-    out: &mut Vec<Vec<u8>>,
-) {
-    if sequence.is_empty() {
-        return;
-    }
-
+fn collect_unicode_segments(sequence: &[u8]) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut run_start = 0usize;
     let mut run_kind: Option<bool> = None;
@@ -198,39 +246,40 @@ fn split_unicode_runs<R: Rng + ?Sized>(
         }
     }
 
-    merge_segments(
-        sequence,
-        segments,
-        probability,
-        rng,
-        SplitBehavior::Whitespace,
-        out,
-    );
+    segments
 }
 
-fn merge_segments<R: Rng + ?Sized>(
-    sequence: &[u8],
+fn merge_segments<'a, R, F>(
+    sequence: &'a [u8],
     segments: Vec<Segment>,
     probability: f64,
     rng: &mut R,
     behavior: SplitBehavior,
-    out: &mut Vec<Vec<u8>>,
-) {
+    emit: F,
+) where
+    R: Rng + ?Sized,
+    F: FnMut(Cow<'a, [u8]>),
+{
     match behavior {
-        SplitBehavior::Generic => merge_segments_generic(sequence, segments, probability, rng, out),
+        SplitBehavior::Generic => {
+            merge_segments_generic(sequence, segments, probability, rng, emit)
+        }
         SplitBehavior::Whitespace => {
-            merge_segments_whitespace(sequence, segments, probability, rng, out)
+            merge_segments_whitespace(sequence, segments, probability, rng, emit)
         }
     }
 }
 
-fn merge_segments_generic<R: Rng + ?Sized>(
-    sequence: &[u8],
+fn merge_segments_generic<'a, R, F>(
+    sequence: &'a [u8],
     segments: Vec<Segment>,
     probability: f64,
     rng: &mut R,
-    out: &mut Vec<Vec<u8>>,
-) {
+    mut emit: F,
+) where
+    R: Rng + ?Sized,
+    F: FnMut(Cow<'a, [u8]>),
+{
     if segments.is_empty() {
         return;
     }
@@ -238,22 +287,25 @@ fn merge_segments_generic<R: Rng + ?Sized>(
     for (start, end, _) in segments.into_iter().skip(1) {
         let bytes = &sequence[start..end];
         if should_split(probability, rng) {
-            out.push(std::mem::take(&mut buffer));
+            emit(Cow::Owned(std::mem::take(&mut buffer)));
             buffer = bytes.to_vec();
         } else {
             buffer.extend_from_slice(bytes);
         }
     }
-    out.push(buffer);
+    emit(Cow::Owned(buffer));
 }
 
-fn merge_segments_whitespace<R: Rng + ?Sized>(
-    sequence: &[u8],
+fn merge_segments_whitespace<'a, R, F>(
+    sequence: &'a [u8],
     segments: Vec<Segment>,
     probability: f64,
     rng: &mut R,
-    out: &mut Vec<Vec<u8>>,
-) {
+    mut emit: F,
+) where
+    R: Rng + ?Sized,
+    F: FnMut(Cow<'a, [u8]>),
+{
     if segments.is_empty() {
         return;
     }
@@ -269,7 +321,7 @@ fn merge_segments_whitespace<R: Rng + ?Sized>(
         if !is_whitespace {
             if let Some(mut pending) = pending_whitespace.take() {
                 if buffer.is_empty() {
-                    out.push(std::mem::take(&mut pending));
+                    emit(Cow::Owned(std::mem::take(&mut pending)));
                 } else {
                     buffer.extend_from_slice(&pending);
                 }
@@ -297,25 +349,25 @@ fn merge_segments_whitespace<R: Rng + ?Sized>(
 
         if let Some(pending) = pending_whitespace.take() {
             if !buffer.is_empty() {
-                out.push(std::mem::take(&mut buffer));
+                emit(Cow::Owned(std::mem::take(&mut buffer)));
             }
-            out.push(pending);
+            emit(Cow::Owned(pending));
         }
 
         if !buffer.is_empty() {
-            out.push(std::mem::take(&mut buffer));
+            emit(Cow::Owned(std::mem::take(&mut buffer)));
         }
-        out.push(bytes.to_vec());
+        emit(Cow::Owned(bytes.to_vec()));
         idx += 1;
     }
 
     if let Some(pending) = pending_whitespace.take() {
         if !buffer.is_empty() {
-            out.push(std::mem::take(&mut buffer));
+            emit(Cow::Owned(std::mem::take(&mut buffer)));
         }
-        out.push(pending);
+        emit(Cow::Owned(pending));
     } else if !buffer.is_empty() {
-        out.push(buffer);
+        emit(Cow::Owned(buffer));
     }
 }
 
@@ -418,8 +470,7 @@ mod tests {
                 if is_ascii_whitespace(*last) {
                     assert!(
                         chunk.iter().all(|b| is_ascii_whitespace(*b)),
-                        "token {:?} ends with whitespace but is not purely whitespace",
-                        chunk
+                        "token {chunk:?} ends with whitespace but is not purely whitespace"
                     );
                 }
             }
@@ -434,7 +485,7 @@ mod tests {
             split_probability: 0.000001,
             seed: Some(1),
         };
-        let processed = match apply_preprocessor(&cfg, &[seq.clone()]) {
+        let processed = match apply_preprocessor(&cfg, std::slice::from_ref(&seq)) {
             PreprocessedSequences::Owned(data) => data,
             _ => panic!("expected owned sequences"),
         };
@@ -490,8 +541,7 @@ mod tests {
             if ends_with_unicode_whitespace(chunk) {
                 assert!(
                     chunk_is_unicode_whitespace(chunk),
-                    "token {:?} should not have trailing unicode whitespace",
-                    chunk
+                    "token {chunk:?} should not have trailing unicode whitespace"
                 );
             }
         }
@@ -565,5 +615,15 @@ mod tests {
             PreprocessedSequences::Borrowed(slice) => assert_eq!(slice.len(), 1),
             _ => panic!("expected borrowed sequences"),
         }
+    }
+
+    #[test]
+    fn preprocessor_runner_passthrough_when_disabled() {
+        let cfg = PreprocessorConfig::default();
+        let mut runner = PreprocessorRunner::new(cfg);
+        let mut seen = Vec::new();
+        let data = b"hello world".to_vec();
+        runner.process(&data, |segment| seen.push(segment.to_vec()));
+        assert_eq!(seen, vec![b"hello world".to_vec()]);
     }
 }
