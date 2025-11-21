@@ -7,13 +7,14 @@ use rustc_hash::FxHashSet;
 use tokenizers::decoders::{fuse::Fuse, DecoderWrapper};
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::{
+    sequence::Sequence,
     split::{Split as SplitPreTokenizer, SplitPattern},
     PreTokenizerWrapper,
 };
 use tokenizers::tokenizer::{AddedToken, SplitDelimiterBehavior};
 use tokenizers::Tokenizer;
 
-use crate::bytes::{bytes_to_latin1, latin1_to_bytes};
+use crate::bytes::{bytes_to_latin1, bytes_to_string, string_to_bytes, ByteEncoding};
 use crate::config::{PreprocessorConfig, PreprocessorKind, TrainerConfig};
 use crate::error::{BbpeError, Result};
 use crate::serialization::{save_huggingface_tokenizer, tokenizer_json};
@@ -41,6 +42,7 @@ pub struct BinaryTokenizer {
     inner: Tokenizer,
     vocab_bytes: Vec<Vec<u8>>,
     special_ids: FxHashSet<TokenId>,
+    input_encoding: ByteEncoding,
 }
 
 impl BpeModel {
@@ -147,7 +149,12 @@ impl BpeModel {
     /// Creates a derived model trimmed to the requested vocabulary size while preserving merge order.
     pub fn derive_with_vocab(&self, target_vocab_size: usize) -> Result<Self> {
         let leading_count = special_tokens::leading_tokens().len();
-        let trailing_count = self.special_tokens.len();
+        let reasoning_count = if self.config.reasoning_tokens_enabled {
+            special_tokens::reasoning_tokens().len()
+        } else {
+            0
+        };
+        let trailing_count = reasoning_count + self.special_tokens.len();
         let min_vocab = leading_count + 256 + trailing_count;
         if target_vocab_size < min_vocab {
             return Err(BbpeError::InvalidConfig(format!(
@@ -187,8 +194,14 @@ impl BpeModel {
         }
         let byte_start = leading.len();
         let trailing_start = byte_start + 256;
-        if idx >= trailing_start && idx < trailing_start + self.special_tokens.len() {
-            return self.special_tokens[idx - trailing_start].clone();
+        let reasoning_count = if self.config.reasoning_tokens_enabled {
+            special_tokens::reasoning_tokens().len()
+        } else {
+            0
+        };
+        let custom_start = trailing_start + reasoning_count;
+        if idx >= custom_start && idx < custom_start + self.special_tokens.len() {
+            return self.special_tokens[idx - custom_start].clone();
         }
         bytes_to_latin1(&self.token_bytes[idx])
     }
@@ -197,11 +210,17 @@ impl BpeModel {
 impl BinaryTokenizer {
     /// Wraps an existing Hugging Face [`Tokenizer`], extracting binary vocab bytes.
     pub fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
+        let encoding = match tokenizer.get_decoder() {
+            Some(DecoderWrapper::ByteLevel(_)) => ByteEncoding::Gpt2,
+            _ => ByteEncoding::Legacy,
+        };
+        let mut tokenizer = tokenizer;
+        strip_byte_level_pre_tokenizer(&mut tokenizer);
         let mut entries: Vec<(String, TokenId)> = tokenizer.get_vocab(true).into_iter().collect();
         entries.sort_by_key(|(_, id)| *id);
         let vocab_bytes = entries
             .into_iter()
-            .map(|(token, _)| latin1_to_bytes(&token))
+            .map(|(token, _)| string_to_bytes(&token, encoding))
             .collect::<Vec<_>>();
         let mut special_ids = FxHashSet::default();
         for (id, token) in tokenizer.get_added_tokens_decoder() {
@@ -219,6 +238,7 @@ impl BinaryTokenizer {
             inner: tokenizer,
             vocab_bytes,
             special_ids,
+            input_encoding: encoding,
         })
     }
 
@@ -229,21 +249,27 @@ impl BinaryTokenizer {
         entries.sort_by_key(|(_, id)| *id);
         let vocab_bytes = entries
             .into_iter()
-            .map(|(token, _)| latin1_to_bytes(&token))
+            .map(|(token, _)| string_to_bytes(&token, ByteEncoding::Gpt2))
             .collect::<Vec<_>>();
         let leading = special_tokens::leading_tokens().len();
         let trailing_start = leading + 256;
+        let reasoning_count = if model.config.reasoning_tokens_enabled {
+            special_tokens::reasoning_tokens().len()
+        } else {
+            0
+        };
         let mut special_ids = FxHashSet::default();
         for id in 0..leading {
             special_ids.insert(id as TokenId);
         }
         for offset in 0..model.special_tokens.len() {
-            special_ids.insert((trailing_start + offset) as TokenId);
+            special_ids.insert((trailing_start + reasoning_count + offset) as TokenId);
         }
         Ok(Self {
             inner: tokenizer,
             vocab_bytes,
             special_ids,
+            input_encoding: ByteEncoding::Gpt2,
         })
     }
 
@@ -255,7 +281,7 @@ impl BinaryTokenizer {
 
     /// Encodes raw bytes into token identifiers.
     pub fn encode_bytes(&self, data: &[u8], add_special_tokens: bool) -> Result<Vec<TokenId>> {
-        let text = bytes_to_latin1(data);
+        let text = bytes_to_string(data, self.input_encoding);
         let encoding = self
             .inner
             .encode(text, add_special_tokens)
@@ -288,11 +314,46 @@ impl BinaryTokenizer {
     }
 }
 
+fn strip_byte_level_pre_tokenizer(tokenizer: &mut Tokenizer) {
+    let replacement = tokenizer
+        .get_pre_tokenizer()
+        .cloned()
+        .and_then(remove_byte_level_wrapper);
+    match replacement {
+        Some(wrapper) => {
+            tokenizer.with_pre_tokenizer(Some(wrapper));
+        }
+        None => {
+            tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
+        }
+    }
+}
+
+fn remove_byte_level_wrapper(wrapper: PreTokenizerWrapper) -> Option<PreTokenizerWrapper> {
+    match wrapper {
+        PreTokenizerWrapper::ByteLevel(_) => None,
+        PreTokenizerWrapper::Sequence(seq) => {
+            let filtered: Vec<PreTokenizerWrapper> = seq
+                .into_iter()
+                .filter_map(remove_byte_level_wrapper)
+                .collect();
+            match filtered.len() {
+                0 => None,
+                1 => filtered.into_iter().next(),
+                _ => Some(PreTokenizerWrapper::Sequence(Sequence::new(filtered))),
+            }
+        }
+        other => Some(other),
+    }
+}
+
 const ASCII_WHITESPACE_REGEX: &str = r"[ \t\n\r\x0B\x0C]+";
 const UNICODE_WHITESPACE_REGEX: &str = r"[\x{0009}\x{000A}\x{000B}\x{000C}\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}\x{2001}\x{2002}\x{2003}\x{2004}\x{2005}\x{2006}\x{2007}\x{2008}\x{2009}\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]+";
 const NULL_DELIMITED_REGEX: &str = r"\x00+";
 
-fn build_pre_tokenizer(config: &PreprocessorConfig) -> Result<Option<PreTokenizerWrapper>> {
+pub(crate) fn build_pre_tokenizer(
+    config: &PreprocessorConfig,
+) -> Result<Option<PreTokenizerWrapper>> {
     if config.split_probability < 1.0 {
         return Ok(None);
     }

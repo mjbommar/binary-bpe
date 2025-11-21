@@ -7,6 +7,10 @@ use crate::error::{BbpeError, Result};
 use crate::special_tokens;
 use serde::{Deserialize, Serialize};
 
+fn default_true() -> bool {
+    true
+}
+
 /// Preprocessing mode applied before BPE training.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PreprocessorConfig {
@@ -85,6 +89,9 @@ pub struct TrainerConfig {
     /// Forbid merges whose tokens begin with ASCII whitespace unless the token is pure whitespace.
     #[serde(default)]
     pub forbid_leading_whitespace_merges: bool,
+    /// Controls whether reasoning/argument tokens are inserted after the byte alphabet.
+    #[serde(default = "default_true")]
+    pub reasoning_tokens_enabled: bool,
 }
 
 impl TrainerConfig {
@@ -98,7 +105,12 @@ impl TrainerConfig {
     pub fn validate(&self) -> Result<()> {
         self.preprocessor.validate()?;
         let leading_specials = special_tokens::leading_tokens().len();
-        let min_vocab = leading_specials + 256 + self.special_tokens.len();
+        let reasoning_specials = if self.reasoning_tokens_enabled {
+            special_tokens::reasoning_tokens().len()
+        } else {
+            0
+        };
+        let min_vocab = leading_specials + 256 + reasoning_specials + self.special_tokens.len();
         if self.target_vocab_size < min_vocab {
             return Err(BbpeError::InvalidConfig(format!(
                 "target_vocab_size ({}) must be at least {} (leading specials + 256 byte tokens + trailing specials {}).",
@@ -150,7 +162,7 @@ impl Default for TrainerConfig {
             min_frequency: 4,
             allowed_token_lengths: (1..=32).collect(),
             show_progress: true,
-            special_tokens: special_tokens::reasoning_tokens().to_vec(),
+            special_tokens: Vec::new(),
             plateau_frequency_floor: 128,
             plateau_patience: 32,
             plateau_frequency_divisor: 512,
@@ -159,6 +171,7 @@ impl Default for TrainerConfig {
             preprocessor: PreprocessorConfig::default(),
             require_letter_whitespace_merges: false,
             forbid_leading_whitespace_merges: false,
+            reasoning_tokens_enabled: true,
         }
     }
 }
@@ -168,7 +181,6 @@ impl Default for TrainerConfig {
 pub struct TrainerBuilder {
     cfg: TrainerConfig,
     allowed_lengths_overridden: bool,
-    reasoning_tokens_enabled: bool,
     special_tokens_overridden: bool,
     appended_special_tokens: Vec<String>,
 }
@@ -180,7 +192,6 @@ impl Default for TrainerBuilder {
         Self {
             cfg,
             allowed_lengths_overridden: false,
-            reasoning_tokens_enabled: true,
             special_tokens_overridden: false,
             appended_special_tokens: Vec::new(),
         }
@@ -297,7 +308,7 @@ impl TrainerBuilder {
     /// Enables or disables the optional reasoning/argument special tokens.
     #[must_use]
     pub fn reasoning_tokens_enabled(mut self, enabled: bool) -> Self {
-        self.reasoning_tokens_enabled = enabled;
+        self.cfg.reasoning_tokens_enabled = enabled;
         self
     }
 
@@ -327,24 +338,19 @@ impl TrainerBuilder {
         }
         self.cfg.allowed_token_lengths.sort_unstable();
         self.cfg.allowed_token_lengths.dedup();
-        let mut trailing = if self.special_tokens_overridden {
-            std::mem::take(&mut self.cfg.special_tokens)
+        let mut trailing = std::mem::take(&mut self.cfg.special_tokens);
+        if self.special_tokens_overridden {
+            trailing.extend(self.appended_special_tokens.iter().cloned());
         } else {
-            let mut tokens = if self.reasoning_tokens_enabled {
-                special_tokens::reasoning_tokens().to_vec()
-            } else {
-                Vec::new()
-            };
             let leading: HashSet<String> =
                 special_tokens::leading_tokens().iter().cloned().collect();
-            tokens.extend(
+            trailing.extend(
                 self.appended_special_tokens
                     .iter()
                     .filter(|token| !leading.contains(token.as_str()))
                     .cloned(),
             );
-            tokens
-        };
+        }
         special_tokens::dedup_in_place(&mut trailing);
         self.cfg.special_tokens = trailing;
         self.cfg.validate()?;

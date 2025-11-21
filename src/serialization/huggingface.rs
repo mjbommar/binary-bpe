@@ -4,15 +4,38 @@ use std::fs;
 use std::path::Path;
 
 use serde_json::{self, json, Value};
+use tokenizers::decoders::{byte_level::ByteLevel as ByteLevelDecoder, DecoderWrapper};
+use tokenizers::pre_tokenizers::{
+    byte_level::ByteLevel as ByteLevelPreTokenizer, sequence::Sequence, PreTokenizerWrapper,
+};
 use tokenizers::Tokenizer;
 
 use crate::error::{BbpeError, Result};
-use crate::model::BpeModel;
+use crate::model::{build_pre_tokenizer, BpeModel};
 use crate::special_tokens;
 
 /// Builds a Hugging Face tokenizer from the trained model.
 pub fn as_tokenizer(model: &BpeModel) -> Result<Tokenizer> {
-    model.build_tokenizer()
+    let mut tokenizer = model.build_tokenizer()?;
+
+    let mut pre_tokenizers = Vec::new();
+    let byte_level = ByteLevelPreTokenizer::default()
+        .add_prefix_space(false)
+        .trim_offsets(true)
+        .use_regex(false);
+    pre_tokenizers.push(PreTokenizerWrapper::ByteLevel(byte_level));
+    if let Some(split) = build_pre_tokenizer(&model.trainer_config().preprocessor)? {
+        pre_tokenizers.push(split);
+    }
+    if pre_tokenizers.len() == 1 {
+        tokenizer.with_pre_tokenizer(Some(pre_tokenizers.remove(0)));
+    } else if !pre_tokenizers.is_empty() {
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(
+            pre_tokenizers,
+        ))));
+    }
+    tokenizer.with_decoder(Some(DecoderWrapper::ByteLevel(ByteLevelDecoder::default())));
+    Ok(tokenizer)
 }
 
 /// Serialises the trained tokenizer to a JSON string compatible with Hugging Face.
@@ -31,7 +54,7 @@ pub fn tokenizer_json(model: &BpeModel, pretty: bool) -> Result<String> {
         .get("decoder")
         .map_or(true, serde_json::Value::is_null)
     {
-        value["decoder"] = serde_json::json!({"type": "Fuse"});
+        value["decoder"] = serde_json::json!({"type": "ByteLevel"});
     }
 
     let mut added_tokens = Vec::new();
@@ -47,9 +70,14 @@ pub fn tokenizer_json(model: &BpeModel, pretty: bool) -> Result<String> {
         }));
     }
     let trailing_start = special_tokens::leading_tokens().len() + 256;
+    let reasoning_offset = if model.trainer_config().reasoning_tokens_enabled {
+        special_tokens::reasoning_tokens().len()
+    } else {
+        0
+    };
     for (offset, token) in model.special_tokens().iter().enumerate() {
         added_tokens.push(json!({
-            "id": (trailing_start + offset) as u32,
+            "id": (trailing_start + reasoning_offset + offset) as u32,
             "content": token,
             "single_word": false,
             "lstrip": false,

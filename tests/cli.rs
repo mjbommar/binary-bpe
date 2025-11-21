@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from tokenizers import Tokenizer
 
+
 tokenizer_path, sample_path = sys.argv[1], sys.argv[2]
 tokenizer = Tokenizer.from_file(tokenizer_path)
 data = Path(sample_path).read_bytes()
@@ -674,10 +675,14 @@ fn probabilistic_preprocessor_disables_pre_tokenizer() {
 
     let json = fs::read_to_string(&tokenizer_path).expect("read tokenizer");
     let parsed: Value = serde_json::from_str(&json).expect("parse tokenizer json");
+    let pre = parsed
+        .get("pre_tokenizer")
+        .and_then(|value| value.as_object())
+        .expect("byte-level pre_tokenizer present");
     assert_eq!(
-        parsed.get("pre_tokenizer"),
-        Some(&Value::Null),
-        "probabilistic preprocessors should serialize a null pre_tokenizer"
+        pre.get("type").and_then(Value::as_str),
+        Some("ByteLevel"),
+        "probabilistic preprocessors keep only the byte-level stage"
     );
 }
 

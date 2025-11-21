@@ -144,7 +144,10 @@ impl Trainer {
 
         let mut runner = PreprocessorRunner::new(self.cfg.preprocessor.clone());
         let leading_specials = special_tokens::leading_tokens();
-        let trailing_specials = self.cfg.special_tokens.clone();
+        let trailing_specials = special_tokens::trailing_tokens(
+            self.cfg.reasoning_tokens_enabled,
+            &self.cfg.special_tokens,
+        );
         let leading_count = leading_specials.len();
         let trailing_count = trailing_specials.len();
         let byte_vocab = 256usize;

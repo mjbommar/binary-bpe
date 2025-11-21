@@ -738,7 +738,10 @@ fn assemble_aggregated_merges(
 ) -> Result<(BpeModel, CombineStats)> {
     let requested = target_merge_budget(trainer_cfg);
     let leading = special_tokens::leading_tokens();
-    let trailing = trainer_cfg.special_tokens.clone();
+    let trailing = special_tokens::trailing_tokens(
+        trainer_cfg.reasoning_tokens_enabled,
+        &trainer_cfg.special_tokens,
+    );
     let mut token_map: FxHashMap<Vec<u8>, TokenId> = FxHashMap::default();
     let mut token_bytes: Vec<Vec<u8>> = Vec::new();
 
@@ -833,7 +836,9 @@ fn assemble_aggregated_merges(
 }
 
 fn target_merge_budget(cfg: &TrainerConfig) -> usize {
-    let base_vocab = special_tokens::leading_tokens().len() + 256usize + cfg.special_tokens.len();
+    let trailing =
+        special_tokens::trailing_tokens(cfg.reasoning_tokens_enabled, &cfg.special_tokens);
+    let base_vocab = special_tokens::leading_tokens().len() + 256usize + trailing.len();
     cfg.target_vocab_size.saturating_sub(base_vocab)
 }
 
