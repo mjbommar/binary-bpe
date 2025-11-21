@@ -1,3 +1,4 @@
+samples/
 /target
 **/*.rs.bk
 **/*.swp
