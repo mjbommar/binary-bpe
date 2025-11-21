@@ -1,7 +1,10 @@
 # Changelog
 
 ## Unreleased
-- _Nothing yet._
+- Ensured every Hugging Face export wraps the trained model with a ByteLevel pre-tokenizer/decoder, preserving non-ASCII bytes (CJK, emoji, reasoning glyphs, etc.) even when downstream tokenizers are run outside of `bbpe`.
+- Reworked serialization to use the GPT-2 byte alphabet end-to-end, teaching `BinaryTokenizer` to detect existing ByteLevel decoders and strip them when round-tripping so legacy Latin-1 artefacts keep working.
+- Moved the Category 4 reasoning/argumentation tokens into the fixed base vocabulary (immediately after the 256-byte alphabet) instead of marking them as specials, preventing Hugging Face from stripping them during decode while keeping the CLI toggles intact.
+- Updated probabilistic preprocessor exports to keep the mandatory ByteLevel stage but drop only the optional whitespace/null splitter, aligning inference byte streams with what the trainer actually saw and refreshing the CLI tests/docs to describe the behavior.
 
 ## 0.6.1 - 2025-11-21
 - Added an incremental preprocessing pipeline (`PreprocessorRunner`) plus the new `SequenceStream`/`Trainer::train_from_stream` APIs so callers can normalize, tokenize, and aggregate corpora chunk-by-chunk without staging every sequence in memory.

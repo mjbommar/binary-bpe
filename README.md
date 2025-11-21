@@ -146,6 +146,8 @@ uv run --with tokenizers python -c "from tokenizers import Tokenizer; tok = Toke
 
 That script is the same check the CLI tests run: it ensures Hugging Face loads the tokenizer with the reserved IDs intact and reports the exact vocabulary/embedding size.
 
+All exported `tokenizer.json` files now bundle a ByteLevel pre-tokenizer/decoder pair ahead of any optional whitespace/null splitter. This guarantees that non-ASCII code points and literal reasoning glyphs survive encode/decode in Hugging Face even when you rely on probabilistic preprocessing during training.
+
 ## Preprocessing Modes
 
 `bbpe` optionally splits inputs before merge counting:
@@ -155,7 +157,7 @@ That script is the same check the CLI tests run: it ensures Hugging Face loads t
 - **null-delimited** – Splits on contiguous `0x00` runs (great for binaries with C strings or padded records).
 - **none** – Raw byte stream.
 
-Set `--preprocessor-probability <P>` (or `TrainerConfig::builder().preprocessor_split_probability(P)`) to randomly *keep* only a subset of boundaries. Example: `P=0.8` keeps 80 % of whitespace splits while letting 20 % of tokens cross word boundaries, encouraging the model to learn multi-word merges. Provide `--preprocessor-seed` for reproducibility. Hugging Face exports automatically drop the pre-tokenizer section when `P < 1.0`, so downstream inference sees the exact byte stream used during training.
+Set `--preprocessor-probability <P>` (or `TrainerConfig::builder().preprocessor_split_probability(P)`) to randomly *keep* only a subset of boundaries. Example: `P=0.8` keeps 80 % of whitespace splits while letting 20 % of tokens cross word boundaries, encouraging the model to learn multi-word merges. Provide `--preprocessor-seed` for reproducibility. When `P < 1.0`, Hugging Face exports retain only the ByteLevel stage so inference still consumes the raw byte stream that training observed, while deterministic runs (`P = 1`) append the configured whitespace/null splitter after the ByteLevel layer.
 
 Enable `--whitespace-merges-require-letter` (or `TrainerConfig::builder().require_letter_whitespace_merges(true)`) to stop numeric/punctuation-only spans from merging with whitespace while still permitting true words (containing ASCII letters) to retain their surrounding spaces. Add `--forbid-leading-whitespace-merges` (or `.forbid_leading_whitespace_merges(true)`) when you want all learned tokens to begin with non-whitespace bytes, keeping boundary markers in their own tokens while still allowing internal whitespace.
 
