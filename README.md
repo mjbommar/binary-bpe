@@ -16,7 +16,7 @@ Binary-aware byte pair encoding (BPE) toolkit for Rust. `bbpe` trains Hugging Fa
 cargo install bbpe
 
 # Add as a dependency (library only)
-cargo add bbpe@0.6.2
+cargo add bbpe@0.6.3
 ```
 
 For library-only usage without the CLI feature:

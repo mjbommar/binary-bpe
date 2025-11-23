@@ -210,18 +210,24 @@ impl Trainer {
         let allowed_lengths = self.cfg.allowed_token_lengths.clone();
         let mut token_bytes: Vec<Vec<u8>> = Vec::with_capacity(self.cfg.target_vocab_size);
         let mut token_lengths: Vec<usize> = Vec::with_capacity(self.cfg.target_vocab_size);
+        let mut token_lookup: FxHashSet<Vec<u8>> =
+            FxHashSet::with_capacity_and_hasher(self.cfg.target_vocab_size, Default::default());
         for token in leading_specials {
             let bytes = token.as_bytes().to_vec();
             token_lengths.push(bytes.len());
+            token_lookup.insert(bytes.clone());
             token_bytes.push(bytes);
         }
         for byte in 0u8..=u8::MAX {
-            token_bytes.push(vec![byte]);
-            token_lengths.push(1);
+            let bytes = vec![byte];
+            token_lengths.push(bytes.len());
+            token_lookup.insert(bytes.clone());
+            token_bytes.push(bytes);
         }
         for token in &trailing_specials {
             let bytes = token.as_bytes().to_vec();
             token_lengths.push(bytes.len());
+            token_lookup.insert(bytes.clone());
             token_bytes.push(bytes);
         }
         let mut merges: Vec<Pair> = Vec::with_capacity(max_new_tokens);
@@ -342,6 +348,11 @@ impl Trainer {
                 pair_counts.remove(&best_pair);
                 continue;
             }
+            if !token_lookup.insert(new_token.clone()) {
+                pair_counts.remove(&best_pair);
+                continue;
+            }
+
             let new_token_id = TokenId::try_from(token_bytes.len())
                 .map_err(|_| BbpeError::Internal("vocabulary size exceeded u32::MAX".into()))?;
 
@@ -416,6 +427,7 @@ impl Trainer {
         pad_vocabulary_with_whitespace(
             &mut token_bytes,
             &mut token_lengths,
+            &mut token_lookup,
             self.cfg.target_vocab_size,
         );
 
@@ -567,12 +579,12 @@ const WHITESPACE_PADDING_BYTES: [u8; 4] = [b' ', b'\t', b'\n', b'\r'];
 fn pad_vocabulary_with_whitespace(
     token_bytes: &mut Vec<Vec<u8>>,
     token_lengths: &mut Vec<usize>,
+    token_lookup: &mut FxHashSet<Vec<u8>>,
     target_vocab_size: usize,
 ) {
     if token_bytes.len() >= target_vocab_size {
         return;
     }
-    let mut existing: FxHashSet<Vec<u8>> = token_bytes.iter().cloned().collect();
     let mut needed = target_vocab_size - token_bytes.len();
     let mut run_len = 2usize;
     while needed > 0 {
@@ -581,7 +593,7 @@ fn pad_vocabulary_with_whitespace(
                 break;
             }
             let candidate = vec![byte; run_len];
-            if existing.insert(candidate.clone()) {
+            if token_lookup.insert(candidate.clone()) {
                 token_lengths.push(candidate.len());
                 token_bytes.push(candidate);
                 needed -= 1;
@@ -592,7 +604,7 @@ fn pad_vocabulary_with_whitespace(
 
     while token_bytes.len() < target_vocab_size {
         let mut candidate = vec![0u8, (token_bytes.len() & 0xFF) as u8];
-        while !existing.insert(candidate.clone()) {
+        while !token_lookup.insert(candidate.clone()) {
             candidate[1] = candidate[1].wrapping_add(1);
         }
         token_lengths.push(candidate.len());
@@ -647,6 +659,7 @@ mod tests {
     };
     use crate::model::BinaryTokenizer;
     use crate::serialization;
+    use rustc_hash::FxHashSet;
     use tempfile::tempdir;
 
     fn trainer(min_frequency: usize, vocab_size: usize) -> Trainer {
@@ -803,5 +816,34 @@ mod tests {
                 b"\r\r".to_vec()
             ]
         );
+    }
+
+    #[test]
+    fn trainer_avoids_duplicate_special_token_bytes() {
+        let glyph = "●".as_bytes().to_vec();
+        let mut sequence = Vec::new();
+        for _ in 0..64 {
+            sequence.extend_from_slice(&glyph);
+        }
+        let cfg = TrainerConfig::builder()
+            .min_frequency(1)
+            .target_vocab_size(400)
+            .special_tokens(Vec::<String>::new())
+            .reasoning_tokens_enabled(true)
+            .show_progress(false)
+            .build()
+            .unwrap();
+        let trainer = Trainer::new(cfg);
+        let artefacts = trainer
+            .train_from_sequences(vec![sequence])
+            .expect("training succeeds with repeated reasoning glyph");
+        let mut seen = FxHashSet::default();
+        for token in artefacts.model.token_bytes() {
+            assert!(
+                seen.insert(token.clone()),
+                "duplicate token bytes detected: {:?}",
+                token
+            );
+        }
     }
 }

@@ -3,6 +3,10 @@
 ## Unreleased
 - _Nothing yet._
 
+## 0.6.3 - 2025-11-23
+- Hardened the streaming trainer so it tracks every byte sequence already present in the vocabulary, skipping merges that would recreate leading specials, byte tokens, or reasoning glyphs; this eliminates the OrderedVocab “holes” warning when corpora contain those symbols and keeps Hugging Face exports contiguous.
+- Updated the whitespace padding helper and added a regression test that repeatedly feeds the “●” reasoning glyph through `Trainer::train_from_sequences`, ensuring no duplicate token bytes can ever enter the vocabulary again.
+
 ## 0.6.2 - 2025-11-21
 - Ensured every Hugging Face export wraps the trained model with a ByteLevel pre-tokenizer/decoder, preserving non-ASCII bytes (CJK, emoji, reasoning glyphs, etc.) even when downstream tokenizers are run outside of `bbpe`.
 - Reworked serialization to use the GPT-2 byte alphabet end-to-end, teaching `BinaryTokenizer` to detect existing ByteLevel decoders and strip them when round-tripping so legacy Latin-1 artefacts keep working.
