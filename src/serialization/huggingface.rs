@@ -58,7 +58,8 @@ pub fn tokenizer_json(model: &BpeModel, pretty: bool) -> Result<String> {
     }
 
     let mut added_tokens = Vec::new();
-    for (idx, token) in special_tokens::leading_tokens().iter().enumerate() {
+    let leading = special_tokens::leading_tokens();
+    for (idx, token) in leading.iter().enumerate() {
         added_tokens.push(json!({
             "id": idx as u32,
             "content": token,
@@ -69,9 +70,11 @@ pub fn tokenizer_json(model: &BpeModel, pretty: bool) -> Result<String> {
             "special": true
         }));
     }
-    let trailing_start = special_tokens::leading_tokens().len() + 256;
-    let reasoning_offset = if model.trainer_config().reasoning_tokens_enabled {
-        special_tokens::reasoning_tokens().len()
+    let trailing_start = leading.len() + 256;
+    let reasoning_tokens = special_tokens::reasoning_tokens();
+    let reasoning_enabled = model.trainer_config().reasoning_tokens_enabled;
+    let reasoning_offset = if reasoning_enabled {
+        reasoning_tokens.len()
     } else {
         0
     };

@@ -1919,17 +1919,71 @@ fn run_info(args: InfoArgs) -> Result<()> {
             special_token_ids.insert(token.content.clone(), value);
         }
     }
-    let summary = json!({
-        "path": args.tokenizer.display().to_string(),
-        "model_type": parsed.model.kind,
-        "base_vocab_size": base_vocab,
-        "special_vocab_size": special_count,
-        "total_vocab_size": total_vocab,
-        "merges": merges,
-        "byte_fallback": parsed.model.byte_fallback,
-        "special_tokens": special_tokens,
-        "special_token_ids": special_token_ids,
-    });
+    let mut reverse_vocab = vec![None; total_vocab];
+    for (token, id_value) in &parsed.model.vocab {
+        if let Some(id) = id_value.as_u64() {
+            if let Ok(idx) = usize::try_from(id) {
+                if idx < reverse_vocab.len() {
+                    reverse_vocab[idx] = Some(token.clone());
+                }
+            }
+        }
+    }
+    let reasoning_expected = special_tokens::reasoning_tokens();
+    let reasoning_start = special_tokens::leading_tokens().len() + 256;
+    let mut reasoning_actual = Vec::new();
+    let mut reasoning_mismatches = Vec::new();
+    let mut reasoning_matches = true;
+    for (offset, glyph) in reasoning_expected.iter().enumerate() {
+        let idx = reasoning_start + offset;
+        if let Some(Some(token)) = reverse_vocab.get(idx) {
+            let decoded = latin1_to_bytes(token);
+            let label = String::from_utf8(decoded.clone())
+                .unwrap_or_else(|_| format!("(non-utf8, {} bytes)", decoded.len()));
+            reasoning_actual.push(label.clone());
+            if decoded != glyph.as_bytes() {
+                reasoning_matches = false;
+                reasoning_mismatches.push(json!({
+                    "id": idx,
+                    "expected": glyph,
+                    "actual": label,
+                }));
+            }
+        } else {
+            reasoning_matches = false;
+            reasoning_actual.push("(missing)".into());
+            reasoning_mismatches.push(json!({
+                "id": idx,
+                "expected": glyph,
+                "actual": serde_json::Value::Null,
+            }));
+        }
+    }
+
+    let mut summary_map = serde_json::Map::new();
+    summary_map.insert("path".into(), json!(args.tokenizer.display().to_string()));
+    summary_map.insert("model_type".into(), json!(parsed.model.kind));
+    summary_map.insert("base_vocab_size".into(), json!(base_vocab));
+    summary_map.insert("special_vocab_size".into(), json!(special_count));
+    summary_map.insert("total_vocab_size".into(), json!(total_vocab));
+    summary_map.insert("merges".into(), json!(merges));
+    summary_map.insert("byte_fallback".into(), json!(parsed.model.byte_fallback));
+    summary_map.insert("special_tokens".into(), json!(special_tokens));
+    summary_map.insert(
+        "special_token_ids".into(),
+        serde_json::Value::Object(special_token_ids),
+    );
+    summary_map.insert(
+        "reasoning_tokens".into(),
+        json!({
+            "offset": reasoning_start,
+            "count": reasoning_expected.len(),
+            "matches": reasoning_matches,
+            "tokens": reasoning_actual,
+            "mismatches": reasoning_mismatches,
+        }),
+    );
+    let summary = serde_json::Value::Object(summary_map);
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1957,6 +2011,33 @@ fn run_info(args: InfoArgs) -> Result<()> {
             );
         } else {
             println!("Special tokens: (none)");
+        }
+        if summary["reasoning_tokens"].is_object() {
+            let reasoning = summary["reasoning_tokens"].as_object().unwrap();
+            let offset = reasoning["offset"].as_u64().unwrap_or(0);
+            let count = reasoning["count"].as_u64().unwrap_or(0);
+            let matches = reasoning["matches"].as_bool().unwrap_or(false);
+            if matches {
+                println!(
+                    "Reasoning tokens: enabled ({} tokens @ id {})",
+                    count, offset
+                );
+                if let Some(tokens) = reasoning["tokens"].as_array() {
+                    if !tokens.is_empty() {
+                        let glyphs = tokens.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>();
+                        println!("Reasoning glyphs: {}", glyphs.join(" "));
+                    }
+                }
+            } else {
+                let mismatches = reasoning["mismatches"]
+                    .as_array()
+                    .map(|arr| arr.len())
+                    .unwrap_or(0);
+                println!(
+                    "Reasoning tokens: missing/misaligned ({} mismatches starting at id {})",
+                    mismatches, offset
+                );
+            }
         }
     }
 

@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use bbpe::special_tokens;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::Value;
@@ -683,6 +684,124 @@ fn probabilistic_preprocessor_disables_pre_tokenizer() {
         pre.get("type").and_then(Value::as_str),
         Some("ByteLevel"),
         "probabilistic preprocessors keep only the byte-level stage"
+    );
+}
+
+#[test]
+fn info_reports_reasoning_tokens() {
+    let workspace = temp_workspace();
+    let input_path = workspace.path().join("reasoning.bin");
+    fs::write(&input_path, "Reasoning glyphs appear here: ⧈ ⚖ ⏵ ✦")
+        .expect("write reasoning sample");
+    let enabled_path = workspace.path().join("reasoning-enabled.json");
+    let disabled_path = workspace.path().join("reasoning-disabled.json");
+
+    let mut enabled_train = Command::cargo_bin("bbpe").expect("binary exists");
+    enabled_train.current_dir(workspace.path()).args([
+        "--quiet",
+        "train",
+        input_path.file_name().unwrap().to_str().unwrap(),
+        "--vocab-size",
+        "400",
+        "--min-frequency",
+        "1",
+        "--chunk-size",
+        "0",
+        "--no-progress",
+        "-o",
+        enabled_path.file_name().unwrap().to_str().unwrap(),
+    ]);
+    run_command(&mut enabled_train);
+
+    let mut disabled_train = Command::cargo_bin("bbpe").expect("binary exists");
+    disabled_train.current_dir(workspace.path()).args([
+        "--quiet",
+        "train",
+        input_path.file_name().unwrap().to_str().unwrap(),
+        "--vocab-size",
+        "270",
+        "--min-frequency",
+        "1",
+        "--chunk-size",
+        "0",
+        "--no-progress",
+        "--disable-reasoning-tokens",
+        "-o",
+        disabled_path.file_name().unwrap().to_str().unwrap(),
+    ]);
+    run_command(&mut disabled_train);
+
+    let mut enabled_info = Command::cargo_bin("bbpe").expect("binary exists");
+    let enabled_output = enabled_info
+        .current_dir(workspace.path())
+        .args([
+            "--quiet",
+            "info",
+            "-m",
+            enabled_path.file_name().unwrap().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let enabled_summary: Value =
+        serde_json::from_slice(&enabled_output).expect("parse info json (enabled)");
+    let enabled_reasoning = enabled_summary["reasoning_tokens"]
+        .as_object()
+        .expect("reasoning field present (enabled)");
+    assert_eq!(
+        enabled_reasoning.get("matches"),
+        Some(&Value::Bool(true)),
+        "reasoning tokens should be reported as present"
+    );
+    let glyphs = enabled_reasoning["tokens"]
+        .as_array()
+        .expect("glyph list present (enabled)");
+    let expected: Vec<Value> = special_tokens::reasoning_tokens()
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect();
+    assert_eq!(
+        *glyphs, expected,
+        "info should decode the canonical reasoning glyphs"
+    );
+
+    let mut disabled_info = Command::cargo_bin("bbpe").expect("binary exists");
+    let disabled_output = disabled_info
+        .current_dir(workspace.path())
+        .args([
+            "--quiet",
+            "info",
+            "-m",
+            disabled_path.file_name().unwrap().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let disabled_summary: Value =
+        serde_json::from_slice(&disabled_output).expect("parse info json (disabled)");
+    let disabled_reasoning = disabled_summary["reasoning_tokens"]
+        .as_object()
+        .expect("reasoning field present (disabled)");
+    assert_eq!(
+        disabled_reasoning.get("matches"),
+        Some(&Value::Bool(false)),
+        "reasoning tokens should be reported as missing when disabled"
+    );
+    let mismatch_count = disabled_reasoning["mismatches"]
+        .as_array()
+        .map(|arr| arr.len())
+        .unwrap_or(0);
+    assert_eq!(
+        mismatch_count,
+        special_tokens::reasoning_tokens().len(),
+        "each reasoning slot should be flagged as mismatched when disabled"
     );
 }
 

@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- _Nothing yet._
+- Enhanced `bbpe info` so it inspects the reasoning/argumentation block inside the vocabulary, decodes the canonical glyphs, and reports whether the Category 4 range is intact (plus the full glyph list) without forcing you to reverse the ByteLevel serialization by hand.
 
 ## 0.6.3 - 2025-11-23
 - Hardened the streaming trainer so it tracks every byte sequence already present in the vocabulary, skipping merges that would recreate leading specials, byte tokens, or reasoning glyphs; this eliminates the OrderedVocab “holes” warning when corpora contain those symbols and keeps Hugging Face exports contiguous.

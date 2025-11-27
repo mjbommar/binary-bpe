@@ -136,7 +136,7 @@ Every tokenizer now shares a deterministic layout:
 3. The 47 Category 4 reasoning tokens occupy the next block by default (disable them with `--disable-reasoning-tokens` or `TrainerBuilder::reasoning_tokens_enabled(false)`).
 4. Any additional custom specials you pass via `--special-token` are appended after the reserved IDs, followed by the learned “real” vocabulary.
 
-`bbpe info -m tokenizer.json` now prints the base, special, and total counts so you can confirm the embedding dimension (`total`) and ensure the optional reasoning tokens are toggled the way you expect.
+`bbpe info -m tokenizer.json` now prints the base, special, and total counts so you can confirm the embedding dimension (`total`) and ensure the optional reasoning tokens are toggled the way you expect. The same command decodes the reasoning block in-place and prints the human-readable glyph list so you can audit the export without reverse-engineering the ByteLevel encoding.
 
 From Python, you can double-check the Hugging Face view with `uv` (replace the path with your tokenizer):
 
