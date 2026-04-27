@@ -112,13 +112,23 @@ Notable flags:
 ### `encode`
 
 ```
-bbpe encode -m tokenizer.json <FILES>... [--json] [--output PATH] [--skip-special-tokens]
+bbpe encode -m tokenizer.json <FILES>... [--json] [--output-dir DIR] [--legacy-byte-behavior auto|plain|escaped]
 ```
+
+For legacy tokenizer JSONs without a ByteLevel decoder, `--legacy-byte-behavior`
+controls how byte values that collide with single-codepoint special tokens are
+handled:
+
+- `auto` (default) detects private-use escaped byte entries in the tokenizer
+  vocabulary.
+- `plain` treats legacy strings as direct Latin-1 bytes.
+- `escaped` forces the historical private-use escape mapping for actual
+  single-codepoint Latin-1 special tokens.
 
 ### `decode`
 
 ```
-bbpe decode -m tokenizer.json [IDS]... [--input PATH] [--output PATH] [--skip-special-tokens]
+bbpe decode -m tokenizer.json [IDS]... [--input PATH] [--output PATH] [--skip-special-tokens] [--legacy-byte-behavior auto|plain|escaped]
 ```
 
 ### `info`
@@ -133,7 +143,7 @@ Every tokenizer now shares a deterministic layout:
 
 1. Category 3 tokens `<|start|>`, `<|end|>`, `<|pad|>`, `<|unk|>`, `<|cls|>`, `<|sep|>`, `<|mask|>` are always IDs `0-6`.
 2. The raw byte alphabet (`0x00`–`0xFF`) fills IDs `7-262`.
-3. The 47 Category 4 reasoning tokens occupy the next block by default (disable them with `--disable-reasoning-tokens` or `TrainerBuilder::reasoning_tokens_enabled(false)`).
+3. The 49 Category 4 reasoning tokens occupy the next block by default (disable them with `--disable-reasoning-tokens` or `TrainerBuilder::reasoning_tokens_enabled(false)`).
 4. Any additional custom specials you pass via `--special-token` are appended after the reserved IDs, followed by the learned “real” vocabulary.
 
 `bbpe info -m tokenizer.json` now prints the base, special, and total counts so you can confirm the embedding dimension (`total`) and ensure the optional reasoning tokens are toggled the way you expect. The same command decodes the reasoning block in-place and prints the human-readable glyph list so you can audit the export without reverse-engineering the ByteLevel encoding.

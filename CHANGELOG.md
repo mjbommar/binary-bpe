@@ -1,7 +1,12 @@
 # Changelog
 
 ## Unreleased
-- _Nothing yet._
+- Added `BinaryTokenizerOptions` and `LegacyByteBehavior` so callers can use
+  `auto`, `plain`, or `escaped` handling for legacy Latin-1 tokenizer JSONs.
+- Fixed legacy tokenizer loading so plain Latin-1 vocabularies no longer remap
+  bytes like `0xAB`/`0xBB` unless private-use escaped byte entries are actually
+  present.
+- Added `bbpe encode/decode --legacy-byte-behavior auto|plain|escaped`.
 
 ## 0.6.4 - 2025-11-24
 - Enhanced `bbpe info` so it inspects the reasoning/argumentation block inside the vocabulary, decodes the canonical glyphs, and reports whether the Category 4 range is intact (plus the full glyph list) without forcing you to reverse the ByteLevel serialization by hand.

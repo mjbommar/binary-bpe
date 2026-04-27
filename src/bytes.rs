@@ -10,20 +10,28 @@ use crate::special_tokens;
 pub enum ByteEncoding {
     /// Legacy Latin-1 mapping with private-use overrides used prior to 0.6.2.
     Legacy,
+    /// Plain legacy Latin-1 mapping without private-use overrides.
+    LegacyPlain,
     /// GPT-2 style byte-level alphabet compatible with Hugging Face's byte fallback logic.
     Gpt2,
 }
 
-fn byte_overrides() -> &'static (HashMap<u8, char>, HashMap<char, u8>) {
-    static OVERRIDES: OnceLock<(HashMap<u8, char>, HashMap<char, u8>)> = OnceLock::new();
-    OVERRIDES.get_or_init(|| {
+/// Per-tokenizer byte remapping for legacy Latin-1 tokenizers whose special
+/// tokens collide with byte values.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LegacyByteOverrides {
+    forward: HashMap<u8, char>,
+    reverse: HashMap<char, u8>,
+}
+
+impl LegacyByteOverrides {
+    /// Builds override maps for single-codepoint special tokens in the Latin-1 range.
+    #[must_use]
+    pub fn from_special_tokens<'a>(tokens: impl IntoIterator<Item = &'a str>) -> Self {
         let mut forward = HashMap::new();
         let mut reverse = HashMap::new();
         let mut next = 0xE000u32;
-        for token in special_tokens::leading_tokens()
-            .iter()
-            .chain(special_tokens::reasoning_tokens().iter())
-        {
+        for token in tokens {
             if token.chars().count() == 1 {
                 let ch = token.chars().next().unwrap();
                 if (ch as u32) <= 0xFF {
@@ -38,8 +46,35 @@ fn byte_overrides() -> &'static (HashMap<u8, char>, HashMap<char, u8>) {
                 }
             }
         }
-        (forward, reverse)
-    })
+        Self { forward, reverse }
+    }
+
+    /// Builds the historical override map for built-in special tokens.
+    #[must_use]
+    pub fn built_in() -> Self {
+        Self::from_special_tokens(
+            special_tokens::leading_tokens()
+                .iter()
+                .chain(special_tokens::reasoning_tokens().iter())
+                .map(String::as_str),
+        )
+    }
+
+    /// Returns true when no bytes are remapped.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.forward.is_empty()
+    }
+
+    /// Returns replacement characters used by this override map.
+    pub fn replacement_chars(&self) -> impl Iterator<Item = char> + '_ {
+        self.reverse.keys().copied()
+    }
+}
+
+fn byte_overrides() -> &'static LegacyByteOverrides {
+    static OVERRIDES: OnceLock<LegacyByteOverrides> = OnceLock::new();
+    OVERRIDES.get_or_init(LegacyByteOverrides::built_in)
 }
 
 fn byte_level_tables() -> &'static ([char; 256], HashMap<char, u8>) {
@@ -62,7 +97,7 @@ fn byte_level_tables() -> &'static ([char; 256], HashMap<char, u8>) {
             seen.insert(byte);
             n += 1;
         }
-        for (byte, codepoint) in bs.into_iter().zip(cs.into_iter()) {
+        for (byte, codepoint) in bs.into_iter().zip(cs) {
             let ch = std::char::from_u32(codepoint).expect("valid byte-level code point");
             forward[byte as usize] = ch;
             reverse.insert(ch, byte);
@@ -72,17 +107,35 @@ fn byte_level_tables() -> &'static ([char; 256], HashMap<char, u8>) {
 }
 
 fn encode_legacy(bytes: &[u8]) -> String {
-    let (forward, _) = byte_overrides();
-    bytes
-        .iter()
-        .map(|&b| forward.get(&b).copied().unwrap_or(b as char))
-        .collect()
+    encode_legacy_with_overrides(bytes, byte_overrides())
+}
+
+fn encode_legacy_plain(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
 }
 
 fn decode_legacy(text: &str) -> Vec<u8> {
-    let (_, reverse) = byte_overrides();
+    decode_legacy_with_overrides(text, byte_overrides())
+}
+
+fn decode_legacy_plain(text: &str) -> Vec<u8> {
+    text.chars().map(|c| c as u8).collect()
+}
+
+/// Converts bytes using a caller-provided legacy override map.
+#[must_use]
+pub fn encode_legacy_with_overrides(bytes: &[u8], overrides: &LegacyByteOverrides) -> String {
+    bytes
+        .iter()
+        .map(|&b| overrides.forward.get(&b).copied().unwrap_or(b as char))
+        .collect()
+}
+
+/// Converts a legacy string back to bytes with a caller-provided override map.
+#[must_use]
+pub fn decode_legacy_with_overrides(text: &str, overrides: &LegacyByteOverrides) -> Vec<u8> {
     text.chars()
-        .map(|c| reverse.get(&c).copied().unwrap_or(c as u8))
+        .map(|c| overrides.reverse.get(&c).copied().unwrap_or(c as u8))
         .collect()
 }
 
@@ -108,6 +161,7 @@ fn decode_gpt2(text: &str) -> Vec<u8> {
 pub fn bytes_to_string(bytes: &[u8], encoding: ByteEncoding) -> String {
     match encoding {
         ByteEncoding::Legacy => encode_legacy(bytes),
+        ByteEncoding::LegacyPlain => encode_legacy_plain(bytes),
         ByteEncoding::Gpt2 => encode_gpt2(bytes),
     }
 }
@@ -117,6 +171,7 @@ pub fn bytes_to_string(bytes: &[u8], encoding: ByteEncoding) -> String {
 pub fn string_to_bytes(text: &str, encoding: ByteEncoding) -> Vec<u8> {
     match encoding {
         ByteEncoding::Legacy => decode_legacy(text),
+        ByteEncoding::LegacyPlain => decode_legacy_plain(text),
         ByteEncoding::Gpt2 => decode_gpt2(text),
     }
 }
@@ -205,6 +260,22 @@ mod tests {
         let latin1 = legacy_bytes_to_latin1(&bytes);
         let restored = legacy_latin1_to_bytes(&latin1);
         assert_eq!(restored, bytes);
+    }
+
+    #[test]
+    fn plain_legacy_keeps_latin1_special_glyph_bytes() {
+        let bytes = [0xAB, 0xBB];
+        let latin1 = bytes_to_string(&bytes, ByteEncoding::LegacyPlain);
+        assert_eq!(latin1, "«»");
+        assert_eq!(string_to_bytes(&latin1, ByteEncoding::LegacyPlain), bytes);
+    }
+
+    #[test]
+    fn escaped_legacy_moves_special_glyph_bytes_to_private_use() {
+        let bytes = [0xAB, 0xBB];
+        let latin1 = bytes_to_string(&bytes, ByteEncoding::Legacy);
+        assert_ne!(latin1, "«»");
+        assert_eq!(string_to_bytes(&latin1, ByteEncoding::Legacy), bytes);
     }
 
     #[test]

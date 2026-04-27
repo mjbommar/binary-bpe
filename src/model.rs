@@ -14,7 +14,10 @@ use tokenizers::pre_tokenizers::{
 use tokenizers::tokenizer::{AddedToken, SplitDelimiterBehavior};
 use tokenizers::Tokenizer;
 
-use crate::bytes::{bytes_to_latin1, bytes_to_string, string_to_bytes, ByteEncoding};
+use crate::bytes::{
+    bytes_to_latin1, bytes_to_string, decode_legacy_with_overrides, encode_legacy_with_overrides,
+    string_to_bytes, ByteEncoding, LegacyByteOverrides,
+};
 use crate::config::{PreprocessorConfig, PreprocessorKind, TrainerConfig};
 use crate::error::{BbpeError, Result};
 use crate::serialization::{save_huggingface_tokenizer, tokenizer_json};
@@ -43,6 +46,40 @@ pub struct BinaryTokenizer {
     vocab_bytes: Vec<Vec<u8>>,
     special_ids: FxHashSet<TokenId>,
     input_encoding: ByteEncoding,
+    legacy_overrides: LegacyByteOverrides,
+}
+
+/// Controls how legacy non-ByteLevel tokenizer JSONs handle byte/special-token collisions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LegacyByteBehavior {
+    /// Detect private-use legacy byte escapes from the tokenizer vocabulary.
+    #[default]
+    Auto,
+    /// Treat legacy tokenizer strings as direct Latin-1 bytes.
+    Plain,
+    /// Escape bytes that collide with actual single-codepoint Latin-1 special tokens.
+    Escaped,
+}
+
+/// Options used when wrapping an existing Hugging Face tokenizer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BinaryTokenizerOptions {
+    legacy_byte_behavior: LegacyByteBehavior,
+}
+
+impl BinaryTokenizerOptions {
+    /// Sets the legacy byte collision behavior.
+    #[must_use]
+    pub fn legacy_byte_behavior(mut self, behavior: LegacyByteBehavior) -> Self {
+        self.legacy_byte_behavior = behavior;
+        self
+    }
+
+    /// Returns the configured legacy byte collision behavior.
+    #[must_use]
+    pub fn legacy_byte_behavior_value(&self) -> LegacyByteBehavior {
+        self.legacy_byte_behavior
+    }
 }
 
 impl BpeModel {
@@ -210,8 +247,51 @@ impl BpeModel {
 impl BinaryTokenizer {
     /// Wraps an existing Hugging Face [`Tokenizer`], extracting binary vocab bytes.
     pub fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
+        Self::from_tokenizer_with_options(tokenizer, BinaryTokenizerOptions::default())
+    }
+
+    /// Wraps an existing Hugging Face [`Tokenizer`] with explicit loading options.
+    pub fn from_tokenizer_with_options(
+        tokenizer: Tokenizer,
+        options: BinaryTokenizerOptions,
+    ) -> Result<Self> {
+        let has_byte_level_decoder =
+            matches!(tokenizer.get_decoder(), Some(DecoderWrapper::ByteLevel(_)));
+        let vocab = tokenizer.get_vocab(true);
+        let added_tokens = tokenizer.get_added_tokens_decoder();
+        let mut special_token_strings = added_tokens
+            .iter()
+            .filter(|(_, token)| token.special)
+            .map(|(id, token)| (*id, token.content.as_str()))
+            .collect::<Vec<_>>();
+        for token in special_tokens::reasoning_tokens() {
+            if let Some(id) = vocab.get(token) {
+                special_token_strings.push((*id, token.as_str()));
+            }
+        }
+        special_token_strings.sort_by_key(|(id, _)| *id);
+        special_token_strings.dedup_by_key(|(_, token)| *token);
+        let candidate_overrides = LegacyByteOverrides::from_special_tokens(
+            special_token_strings.iter().map(|(_, token)| *token),
+        );
+        let legacy_overrides = if has_byte_level_decoder {
+            LegacyByteOverrides::default()
+        } else {
+            match options.legacy_byte_behavior {
+                LegacyByteBehavior::Auto => {
+                    if tokenizer_uses_legacy_overrides(&tokenizer, &candidate_overrides) {
+                        candidate_overrides
+                    } else {
+                        LegacyByteOverrides::default()
+                    }
+                }
+                LegacyByteBehavior::Plain => LegacyByteOverrides::default(),
+                LegacyByteBehavior::Escaped => candidate_overrides,
+            }
+        };
         let encoding = match tokenizer.get_decoder() {
             Some(DecoderWrapper::ByteLevel(_)) => ByteEncoding::Gpt2,
+            _ if legacy_overrides.is_empty() => ByteEncoding::LegacyPlain,
             _ => ByteEncoding::Legacy,
         };
         let mut tokenizer = tokenizer;
@@ -220,7 +300,7 @@ impl BinaryTokenizer {
         entries.sort_by_key(|(_, id)| *id);
         let vocab_bytes = entries
             .into_iter()
-            .map(|(token, _)| string_to_bytes(&token, encoding))
+            .map(|(token, _)| decode_token_string(&token, encoding, &legacy_overrides))
             .collect::<Vec<_>>();
         let mut special_ids = FxHashSet::default();
         for (id, token) in tokenizer.get_added_tokens_decoder() {
@@ -239,6 +319,7 @@ impl BinaryTokenizer {
             vocab_bytes,
             special_ids,
             input_encoding: encoding,
+            legacy_overrides,
         })
     }
 
@@ -270,6 +351,7 @@ impl BinaryTokenizer {
             vocab_bytes,
             special_ids,
             input_encoding: ByteEncoding::Gpt2,
+            legacy_overrides: LegacyByteOverrides::default(),
         })
     }
 
@@ -279,9 +361,15 @@ impl BinaryTokenizer {
         &self.inner
     }
 
+    /// Returns the byte-string encoding used to feed the wrapped tokenizer.
+    #[must_use]
+    pub fn input_encoding(&self) -> ByteEncoding {
+        self.input_encoding
+    }
+
     /// Encodes raw bytes into token identifiers.
     pub fn encode_bytes(&self, data: &[u8], add_special_tokens: bool) -> Result<Vec<TokenId>> {
-        let text = bytes_to_string(data, self.input_encoding);
+        let text = encode_input_bytes(data, self.input_encoding, &self.legacy_overrides);
         let encoding = self
             .inner
             .encode(text, add_special_tokens)
@@ -312,6 +400,38 @@ impl BinaryTokenizer {
         }
         Ok(bytes)
     }
+}
+
+fn encode_input_bytes(
+    data: &[u8],
+    encoding: ByteEncoding,
+    legacy_overrides: &LegacyByteOverrides,
+) -> String {
+    match encoding {
+        ByteEncoding::Legacy => encode_legacy_with_overrides(data, legacy_overrides),
+        other => bytes_to_string(data, other),
+    }
+}
+
+fn decode_token_string(
+    token: &str,
+    encoding: ByteEncoding,
+    legacy_overrides: &LegacyByteOverrides,
+) -> Vec<u8> {
+    match encoding {
+        ByteEncoding::Legacy => decode_legacy_with_overrides(token, legacy_overrides),
+        other => string_to_bytes(token, other),
+    }
+}
+
+fn tokenizer_uses_legacy_overrides(tokenizer: &Tokenizer, overrides: &LegacyByteOverrides) -> bool {
+    if overrides.is_empty() {
+        return false;
+    }
+    let vocab = tokenizer.get_vocab(true);
+    overrides
+        .replacement_chars()
+        .any(|ch| vocab.contains_key(&ch.to_string()))
 }
 
 fn strip_byte_level_pre_tokenizer(tokenizer: &mut Tokenizer) {
@@ -419,6 +539,31 @@ mod tests {
         sample_model(special_tokens::leading_tokens().len() + 257, Vec::new())
     }
 
+    fn legacy_latin1_tokenizer(escaped: bool) -> Tokenizer {
+        let mut vocab = AHashMap::new();
+        for byte in 0u8..=255 {
+            let token = match (escaped, byte) {
+                (true, 0xAB) => "\u{E000}".to_string(),
+                (true, 0xBB) => "\u{E001}".to_string(),
+                _ => (byte as char).to_string(),
+            };
+            vocab.insert(token, byte as TokenId);
+        }
+        if escaped {
+            vocab.insert("«".to_string(), 256);
+            vocab.insert("»".to_string(), 257);
+        }
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Vec::<(String, String)>::new())
+            .byte_fallback(true)
+            .build()
+            .expect("valid bpe model");
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_decoder(Some(DecoderWrapper::Fuse(Fuse::new())));
+        tokenizer.add_special_tokens(&[AddedToken::from("<|sep|>".to_string(), true)]);
+        tokenizer
+    }
+
     #[test]
     fn derive_with_vocab_trims_merges_and_tokens() {
         let model = sample_model(300, Vec::new());
@@ -447,6 +592,38 @@ mod tests {
             .decode_to_bytes(&encoded, false)
             .expect("decode should work");
         assert_eq!(decoded, b"hi");
+    }
+
+    #[test]
+    fn legacy_plain_tokenizer_keeps_ab_bb_bytes_lossless() {
+        let tokenizer =
+            BinaryTokenizer::from_tokenizer(legacy_latin1_tokenizer(false)).expect("tokenizer");
+        assert_eq!(tokenizer.input_encoding(), ByteEncoding::LegacyPlain);
+        let bytes = [0x00, 0xAB, 0xBB, 0xAD, 0xFF];
+        let encoded = tokenizer.encode_bytes(&bytes, false).expect("encode");
+        let decoded = tokenizer.decode_to_bytes(&encoded, false).expect("decode");
+        assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn legacy_escaped_tokenizer_auto_detects_private_use_bytes() {
+        let tokenizer =
+            BinaryTokenizer::from_tokenizer(legacy_latin1_tokenizer(true)).expect("tokenizer");
+        assert_eq!(tokenizer.input_encoding(), ByteEncoding::Legacy);
+        let bytes = [0xAB, 0xBB, 0xAB, 0xBB];
+        let encoded = tokenizer.encode_bytes(&bytes, false).expect("encode");
+        let decoded = tokenizer.decode_to_bytes(&encoded, false).expect("decode");
+        assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn legacy_byte_behavior_can_force_plain_mode() {
+        let options =
+            BinaryTokenizerOptions::default().legacy_byte_behavior(LegacyByteBehavior::Plain);
+        let tokenizer =
+            BinaryTokenizer::from_tokenizer_with_options(legacy_latin1_tokenizer(true), options)
+                .expect("tokenizer");
+        assert_eq!(tokenizer.input_encoding(), ByteEncoding::LegacyPlain);
     }
 
     #[test]

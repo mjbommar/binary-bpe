@@ -59,5 +59,5 @@ pub use config::{
 };
 pub use error::{BbpeError, Result};
 pub use metrics::{IterationMetrics, TrainingMetrics};
-pub use model::{BinaryTokenizer, BpeModel, TokenId};
+pub use model::{BinaryTokenizer, BinaryTokenizerOptions, BpeModel, LegacyByteBehavior, TokenId};
 pub use trainer::{Trainer, TrainerArtifacts};

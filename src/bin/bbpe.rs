@@ -15,7 +15,10 @@ use bbpe::corpus::{load_binary_corpus, load_jsonl_corpus, stream_binary_corpus, 
 use bbpe::model::{Pair, TokenId};
 use bbpe::serialization;
 use bbpe::special_tokens;
-use bbpe::{BinaryTokenizer, BpeModel, Trainer, TrainerArtifacts};
+use bbpe::{
+    BinaryTokenizer, BinaryTokenizerOptions, BpeModel, LegacyByteBehavior, Trainer,
+    TrainerArtifacts,
+};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -910,6 +913,14 @@ struct EncodeArgs {
     #[arg(long)]
     add_special_tokens: bool,
 
+    /// Legacy byte collision behavior for non-ByteLevel tokenizer JSONs
+    #[arg(
+        long = "legacy-byte-behavior",
+        value_enum,
+        default_value_t = LegacyByteBehaviorCli::Auto
+    )]
+    legacy_byte_behavior: LegacyByteBehaviorCli,
+
     /// Optional directory to write .tokens files
     #[arg(long, value_name = "DIR")]
     output_dir: Option<PathBuf>,
@@ -933,9 +944,37 @@ struct DecodeArgs {
     #[arg(long)]
     skip_special_tokens: bool,
 
+    /// Legacy byte collision behavior for non-ByteLevel tokenizer JSONs
+    #[arg(
+        long = "legacy-byte-behavior",
+        value_enum,
+        default_value_t = LegacyByteBehaviorCli::Auto
+    )]
+    legacy_byte_behavior: LegacyByteBehaviorCli,
+
     /// Output file for decoded bytes (defaults to stdout)
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LegacyByteBehaviorCli {
+    /// Detect escaped legacy bytes from tokenizer vocabulary.
+    Auto,
+    /// Treat legacy tokenizer strings as direct Latin-1 bytes.
+    Plain,
+    /// Escape bytes that collide with actual single-codepoint Latin-1 specials.
+    Escaped,
+}
+
+impl From<LegacyByteBehaviorCli> for LegacyByteBehavior {
+    fn from(value: LegacyByteBehaviorCli) -> Self {
+        match value {
+            LegacyByteBehaviorCli::Auto => LegacyByteBehavior::Auto,
+            LegacyByteBehaviorCli::Plain => LegacyByteBehavior::Plain,
+            LegacyByteBehaviorCli::Escaped => LegacyByteBehavior::Escaped,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -1816,7 +1855,9 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
 fn run_encode(args: EncodeArgs) -> Result<()> {
     let tokenizer = serialization::load_tokenizer(&args.tokenizer)
         .with_context(|| format!("failed to load tokenizer from {}", args.tokenizer.display()))?;
-    let tokenizer = BinaryTokenizer::from_tokenizer(tokenizer)?;
+    let options =
+        BinaryTokenizerOptions::default().legacy_byte_behavior(args.legacy_byte_behavior.into());
+    let tokenizer = BinaryTokenizer::from_tokenizer_with_options(tokenizer, options)?;
 
     if let Some(dir) = &args.output_dir {
         if !dir.exists() {
@@ -1868,7 +1909,9 @@ fn run_encode(args: EncodeArgs) -> Result<()> {
 fn run_decode(args: DecodeArgs) -> Result<()> {
     let tokenizer = serialization::load_tokenizer(&args.tokenizer)
         .with_context(|| format!("failed to load tokenizer from {}", args.tokenizer.display()))?;
-    let tokenizer = BinaryTokenizer::from_tokenizer(tokenizer)?;
+    let options =
+        BinaryTokenizerOptions::default().legacy_byte_behavior(args.legacy_byte_behavior.into());
+    let tokenizer = BinaryTokenizer::from_tokenizer_with_options(tokenizer, options)?;
 
     let tokens = if let Some(input_path) = &args.input {
         let contents = fs::read_to_string(input_path)
