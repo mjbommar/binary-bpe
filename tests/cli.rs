@@ -806,6 +806,67 @@ fn info_reports_reasoning_tokens() {
 }
 
 #[test]
+fn info_handles_legacy_plain_binary_reasoning_slots() {
+    let workspace = temp_workspace();
+    let tokenizer_path = workspace.path().join("legacy-info.json");
+    let reasoning_start = special_tokens::leading_tokens().len() + 256;
+    let total_vocab = reasoning_start + special_tokens::reasoning_tokens().len();
+    let mut vocab = serde_json::Map::new();
+    for id in 0..total_vocab {
+        let token = if id == reasoning_start {
+            "\u{0000}".to_string()
+        } else {
+            format!("tok{id}")
+        };
+        vocab.insert(token, Value::from(id as u64));
+    }
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "added_tokens": [],
+        "decoder": { "type": "Fuse" },
+        "model": {
+            "type": "BPE",
+            "vocab": vocab,
+            "merges": [],
+            "byte_fallback": true
+        }
+    });
+    fs::write(
+        &tokenizer_path,
+        serde_json::to_string(&tokenizer).expect("serialize tokenizer"),
+    )
+    .expect("write tokenizer");
+
+    let mut info = Command::cargo_bin("bbpe").expect("binary exists");
+    let output = info
+        .current_dir(workspace.path())
+        .args([
+            "--quiet",
+            "info",
+            "-m",
+            tokenizer_path.file_name().unwrap().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summary: Value = serde_json::from_slice(&output).expect("parse info json");
+    let reasoning = summary["reasoning_tokens"]
+        .as_object()
+        .expect("reasoning field present");
+    assert_eq!(reasoning.get("matches"), Some(&Value::Bool(false)));
+    assert_eq!(
+        reasoning["mismatches"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        special_tokens::reasoning_tokens().len()
+    );
+}
+
+#[test]
 fn train_with_max_entropy_filter() {
     let workspace = temp_workspace();
     let low_entropy = workspace.path().join("low.bin");

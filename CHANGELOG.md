@@ -7,6 +7,8 @@
   bytes like `0xAB`/`0xBB` unless private-use escaped byte entries are actually
   present.
 - Added `bbpe encode/decode --legacy-byte-behavior auto|plain|escaped`.
+- Fixed `bbpe info` so legacy plain Latin-1 vocabularies with binary control
+  tokens are inspected without panicking.
 
 ## 0.6.4 - 2025-11-24
 - Enhanced `bbpe info` so it inspects the reasoning/argumentation block inside the vocabulary, decodes the canonical glyphs, and reports whether the Category 4 range is intact (plus the full glyph list) without forcing you to reverse the ByteLevel serialization by hand.

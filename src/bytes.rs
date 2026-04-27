@@ -144,16 +144,19 @@ fn encode_gpt2(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| forward[b as usize]).collect()
 }
 
-fn decode_gpt2(text: &str) -> Vec<u8> {
+fn try_decode_gpt2(text: &str) -> Option<Vec<u8>> {
     let (_, reverse) = byte_level_tables();
-    text.chars()
-        .map(|c| {
-            reverse
-                .get(&c)
-                .copied()
-                .unwrap_or_else(|| panic!("unknown byte-level code point: U+{:04X}", c as u32))
-        })
-        .collect()
+    text.chars().map(|c| reverse.get(&c).copied()).collect()
+}
+
+fn decode_gpt2(text: &str) -> Vec<u8> {
+    try_decode_gpt2(text).unwrap_or_else(|| {
+        let invalid = text
+            .chars()
+            .find(|c| !byte_level_tables().1.contains_key(c))
+            .expect("invalid byte-level code point exists");
+        panic!("unknown byte-level code point: U+{:04X}", invalid as u32);
+    })
 }
 
 /// Converts raw bytes into a serialized string representation.
@@ -186,6 +189,12 @@ pub fn bytes_to_latin1(bytes: &[u8]) -> String {
 #[must_use]
 pub fn latin1_to_bytes(text: &str) -> Vec<u8> {
     string_to_bytes(text, ByteEncoding::Gpt2)
+}
+
+/// Tries to decode GPT-2 byte-level text back to bytes.
+#[must_use]
+pub fn try_latin1_to_bytes(text: &str) -> Option<Vec<u8>> {
+    try_decode_gpt2(text)
 }
 
 /// Converts bytes using the legacy Latin-1 mapping.

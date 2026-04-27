@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use bbpe::bytes::{bytes_to_latin1, latin1_to_bytes};
+use bbpe::bytes::{bytes_to_latin1, latin1_to_bytes, legacy_latin1_to_bytes, try_latin1_to_bytes};
 use bbpe::config::{IngestConfig, PreprocessorConfig, PreprocessorKind, TrainerConfig};
 use bbpe::corpus::{load_binary_corpus, load_jsonl_corpus, stream_binary_corpus, JsonlSpec};
 use bbpe::model::{Pair, TokenId};
@@ -993,6 +993,8 @@ struct TokenizerFile {
     model: ModelSection,
     #[serde(default)]
     added_tokens: Vec<AddedToken>,
+    #[serde(default)]
+    decoder: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -1974,17 +1976,16 @@ fn run_info(args: InfoArgs) -> Result<()> {
     }
     let reasoning_expected = special_tokens::reasoning_tokens();
     let reasoning_start = special_tokens::leading_tokens().len() + 256;
+    let info_encoding = InfoVocabEncoding::from_tokenizer_file(&parsed);
     let mut reasoning_actual = Vec::new();
     let mut reasoning_mismatches = Vec::new();
     let mut reasoning_matches = true;
     for (offset, glyph) in reasoning_expected.iter().enumerate() {
         let idx = reasoning_start + offset;
         if let Some(Some(token)) = reverse_vocab.get(idx) {
-            let decoded = latin1_to_bytes(token);
-            let label = String::from_utf8(decoded.clone())
-                .unwrap_or_else(|_| format!("(non-utf8, {} bytes)", decoded.len()));
+            let (decoded, label) = info_vocab_token_bytes_and_label(token, glyph, info_encoding);
             reasoning_actual.push(label.clone());
-            if decoded != glyph.as_bytes() {
+            if decoded.as_deref() != Some(glyph.as_bytes()) {
                 reasoning_matches = false;
                 reasoning_mismatches.push(json!({
                     "id": idx,
@@ -2197,6 +2198,60 @@ fn default_family_output_path(base: &Path, size: usize) -> PathBuf {
     } else {
         parent.join(filename)
     }
+}
+
+#[derive(Clone, Copy)]
+enum InfoVocabEncoding {
+    ByteLevel,
+    LegacyLatin1,
+}
+
+impl InfoVocabEncoding {
+    fn from_tokenizer_file(parsed: &TokenizerFile) -> Self {
+        if parsed
+            .decoder
+            .as_ref()
+            .is_some_and(json_has_byte_level_type)
+        {
+            Self::ByteLevel
+        } else {
+            Self::LegacyLatin1
+        }
+    }
+}
+
+fn json_has_byte_level_type(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get("type").and_then(serde_json::Value::as_str) == Some("ByteLevel")
+                || map.values().any(json_has_byte_level_type)
+        }
+        serde_json::Value::Array(items) => items.iter().any(json_has_byte_level_type),
+        _ => false,
+    }
+}
+
+fn info_vocab_token_bytes_and_label(
+    token: &str,
+    expected_glyph: &str,
+    encoding: InfoVocabEncoding,
+) -> (Option<Vec<u8>>, String) {
+    if token == expected_glyph {
+        return (Some(expected_glyph.as_bytes().to_vec()), token.to_string());
+    }
+
+    let decoded = match encoding {
+        InfoVocabEncoding::ByteLevel => try_latin1_to_bytes(token),
+        InfoVocabEncoding::LegacyLatin1 => Some(legacy_latin1_to_bytes(token)),
+    };
+    let label = decoded.as_ref().map_or_else(
+        || format!("(undecodable, {} chars)", token.chars().count()),
+        |bytes| {
+            String::from_utf8(bytes.clone())
+                .unwrap_or_else(|_| format!("(non-utf8, {} bytes)", bytes.len()))
+        },
+    );
+    (decoded, label)
 }
 
 #[must_use]
