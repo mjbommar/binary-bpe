@@ -1,11 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.6.5 - 2026-04-29
+- Added `TrainerAlgorithm::LowMemory` (CLI: `--algorithm low-memory`). The
+  default `Fast` trainer keeps an inverted index `pair → Vec<word>` and OOMs
+  on multi-GB corpora; `LowMemory` drops the inverted index and parallel-
+  rescans words on each merge, trading per-merge wall-time for
+  `O(unique_pairs)` memory. Both algorithms produce bit-identical merge
+  tables (verified by `fast_and_low_memory_produce_identical_merges`).
+- Rewrote `Word::merge` with two-pointer compaction; the original used
+  `Vec::remove(i+1)` per merge site, giving `O(N²)` per word on large
+  chunks. Combined with shrinking the per-`Symbol` struct from 16 → 8 bytes
+  (`len: usize` → `u32`), this is roughly 60–100× faster per merge and
+  ~50% lower peak memory on a 5.5 GiB corpus, with no API change.
 - Added `BinaryTokenizerOptions` and `LegacyByteBehavior` so callers can use
   `auto`, `plain`, or `escaped` handling for legacy Latin-1 tokenizer JSONs.
-- Fixed legacy tokenizer loading so plain Latin-1 vocabularies no longer remap
-  bytes like `0xAB`/`0xBB` unless private-use escaped byte entries are actually
-  present.
+- Fixed legacy tokenizer loading so plain Latin-1 vocabularies no longer
+  remap bytes like `0xAB`/`0xBB` unless private-use escaped byte entries are
+  actually present.
 - Added `bbpe encode/decode --legacy-byte-behavior auto|plain|escaped`.
 - Fixed `bbpe info` so legacy plain Latin-1 vocabularies with binary control
   tokens are inspected without panicking.
