@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bbpe::bytes::{bytes_to_latin1, latin1_to_bytes, legacy_latin1_to_bytes, try_latin1_to_bytes};
-use bbpe::config::{IngestConfig, PreprocessorConfig, PreprocessorKind, TrainerConfig};
+use bbpe::config::{
+    IngestConfig, PreprocessorConfig, PreprocessorKind, TrainerAlgorithm, TrainerConfig,
+};
 use bbpe::corpus::{load_binary_corpus, load_jsonl_corpus, stream_binary_corpus, JsonlSpec};
 use bbpe::model::{Pair, TokenId};
 use bbpe::serialization;
@@ -105,6 +107,12 @@ struct TrainArgs {
     /// Disable the optional reasoning/argument special tokens
     #[arg(long = "disable-reasoning-tokens")]
     disable_reasoning_tokens: bool,
+
+    /// Trainer algorithm. `fast` keeps an inverted index (default,
+    /// fastest per-merge but high memory); `low-memory` rescans the
+    /// corpus on each merge in parallel for `O(unique_pairs)` memory.
+    #[arg(long = "algorithm", value_enum, default_value_t = AlgorithmCli::Fast)]
+    algorithm: AlgorithmCli,
 
     /// Preprocessor applied before merge counting
     #[arg(
@@ -230,6 +238,12 @@ struct ChunkTrainArgs {
     /// Disable the optional reasoning/argument special tokens
     #[arg(long = "disable-reasoning-tokens")]
     disable_reasoning_tokens: bool,
+
+    /// Trainer algorithm. `fast` keeps an inverted index (default,
+    /// fastest per-merge but high memory); `low-memory` rescans the
+    /// corpus on each merge in parallel for `O(unique_pairs)` memory.
+    #[arg(long = "algorithm", value_enum, default_value_t = AlgorithmCli::Fast)]
+    algorithm: AlgorithmCli,
 
     /// Preprocessor applied before merge counting
     #[arg(
@@ -371,6 +385,27 @@ enum PreprocessorCli {
     UnicodeWhitespace,
     /// Split on contiguous null-byte runs, useful for binary corpora.
     NullDelimited,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum AlgorithmCli {
+    /// Inverted-index trainer (default). Fastest per-merge; peak memory
+    /// scales with the unique-pair × position-list product. Suited to
+    /// medium corpora.
+    Fast,
+    /// Scan trainer. Drops the inverted index in favour of parallel
+    /// per-merge scans. Peak memory is roughly `O(unique_pairs)`. Use
+    /// this when the fast trainer would OOM on large corpora.
+    LowMemory,
+}
+
+impl From<AlgorithmCli> for TrainerAlgorithm {
+    fn from(value: AlgorithmCli) -> Self {
+        match value {
+            AlgorithmCli::Fast => TrainerAlgorithm::Fast,
+            AlgorithmCli::LowMemory => TrainerAlgorithm::LowMemory,
+        }
+    }
 }
 
 impl From<PreprocessorCli> for PreprocessorConfig {
@@ -1078,6 +1113,7 @@ fn run_train(args: TrainArgs) -> Result<()> {
         cfg = cfg.allowed_token_lengths(args.allowed_lengths.clone());
     }
     cfg = cfg.reasoning_tokens_enabled(!args.disable_reasoning_tokens);
+    cfg = cfg.algorithm(args.algorithm.into());
     if !args.special_tokens.is_empty() {
         cfg = cfg.append_special_tokens(args.special_tokens.clone());
     }
@@ -1303,6 +1339,7 @@ fn run_chunk_train(args: ChunkTrainArgs) -> Result<()> {
         cfg = cfg.allowed_token_lengths(args.allowed_lengths.clone());
     }
     cfg = cfg.reasoning_tokens_enabled(!args.disable_reasoning_tokens);
+    cfg = cfg.algorithm(args.algorithm.into());
     if !args.special_tokens.is_empty() {
         cfg = cfg.append_special_tokens(args.special_tokens.clone());
     }

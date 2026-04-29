@@ -45,6 +45,30 @@ impl PreprocessorConfig {
     }
 }
 
+/// Trainer algorithm selection. The two algorithms produce identical
+/// merges for the same configuration; they differ only in how they
+/// schedule work and how much memory they keep at peak.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TrainerAlgorithm {
+    /// Inverted-index trainer: maintains `pair -> word indices` so each
+    /// merge updates only the affected words. Fastest per-merge, but
+    /// peak memory grows with `O(unique_pairs * avg_words_per_pair)`.
+    /// Suitable for corpora up to roughly a few GiB on a 128 GiB box.
+    Fast,
+    /// Scan trainer: keeps only `pair -> count` and rescans the entire
+    /// word set in parallel on each merge. Peak memory is
+    /// `O(unique_pairs)` — typically MiBs even on multi-GiB corpora —
+    /// at the cost of per-merge wall-time scaling with corpus size.
+    /// Required for corpora that exhaust the inverted-index trainer.
+    LowMemory,
+}
+
+impl Default for TrainerAlgorithm {
+    fn default() -> Self {
+        Self::Fast
+    }
+}
+
 /// Supported preprocessing strategies.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PreprocessorKind {
@@ -92,6 +116,9 @@ pub struct TrainerConfig {
     /// Controls whether reasoning/argument tokens are inserted after the byte alphabet.
     #[serde(default = "default_true")]
     pub reasoning_tokens_enabled: bool,
+    /// Selects the trainer algorithm. See [`TrainerAlgorithm`].
+    #[serde(default)]
+    pub algorithm: TrainerAlgorithm,
 }
 
 impl TrainerConfig {
@@ -172,6 +199,7 @@ impl Default for TrainerConfig {
             require_letter_whitespace_merges: false,
             forbid_leading_whitespace_merges: false,
             reasoning_tokens_enabled: true,
+            algorithm: TrainerAlgorithm::Fast,
         }
     }
 }
@@ -309,6 +337,13 @@ impl TrainerBuilder {
     #[must_use]
     pub fn reasoning_tokens_enabled(mut self, enabled: bool) -> Self {
         self.cfg.reasoning_tokens_enabled = enabled;
+        self
+    }
+
+    /// Selects the trainer algorithm. See [`TrainerAlgorithm`].
+    #[must_use]
+    pub fn algorithm(mut self, algorithm: TrainerAlgorithm) -> Self {
+        self.cfg.algorithm = algorithm;
         self
     }
 

@@ -7,13 +7,14 @@ use std::time::Instant;
 use std::{fmt, path::Path};
 
 use log::info;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bytes::{
     contains_ascii_letter, ends_with_ascii_whitespace, is_all_ascii_whitespace,
     is_ascii_whitespace, starts_with_ascii_whitespace,
 };
-use crate::config::{IngestConfig, TrainerBuilder, TrainerConfig};
+use crate::config::{IngestConfig, TrainerAlgorithm, TrainerBuilder, TrainerConfig};
 use crate::corpus::{stream_binary_corpus, stream_jsonl_corpus, JsonlSpec};
 use crate::error::{BbpeError, Result};
 use crate::metrics::{sample_rss_kb, IterationMetrics, StopReason, TrainingMetrics};
@@ -242,8 +243,21 @@ impl Trainer {
             (local_words, local_counts)
         };
 
-        let (mut pair_counts, mut pair_positions) =
-            compute_pair_stats(&words, &counts, &allowed_lengths);
+        let algorithm = self.cfg.algorithm;
+        if self.cfg.show_progress {
+            info!("trainer algorithm: {algorithm:?}");
+        }
+        // Fast trainer keeps an inverted index pair -> word positions; the
+        // low-memory trainer rebuilds counts via parallel scan on every
+        // merge and stores no positions. The branch determines whether
+        // `pair_positions` is populated.
+        let (mut pair_counts, mut pair_positions) = match algorithm {
+            TrainerAlgorithm::Fast => compute_pair_stats(&words, &counts, &allowed_lengths),
+            TrainerAlgorithm::LowMemory => (
+                compute_pair_counts_scan(&words, &counts, &allowed_lengths),
+                FxHashMap::default(),
+            ),
+        };
         let mut heap = BinaryHeap::with_capacity(pair_counts.len().max(1));
         for (&pair, &count) in &pair_counts {
             if count >= self.cfg.min_frequency {
@@ -255,13 +269,15 @@ impl Trainer {
             .target_vocab_size
             .saturating_mul(PAIR_CACHE_MULTIPLIER)
             .max(MIN_PAIR_CACHE);
-        prune_pair_cache(
-            &mut pair_counts,
-            &mut pair_positions,
-            &mut heap,
-            pair_cache_cap,
-            self.cfg.min_frequency,
-        );
+        if matches!(algorithm, TrainerAlgorithm::Fast) {
+            prune_pair_cache(
+                &mut pair_counts,
+                &mut pair_positions,
+                &mut heap,
+                pair_cache_cap,
+                self.cfg.min_frequency,
+            );
+        }
 
         let mut iteration = 0usize;
         let mut metrics = TrainingMetrics::new(max_new_tokens.min(16_384));
@@ -356,17 +372,29 @@ impl Trainer {
             let new_token_id = TokenId::try_from(token_bytes.len())
                 .map_err(|_| BbpeError::Internal("vocabulary size exceeded u32::MAX".into()))?;
 
-            let total_merges = apply_merge(
-                &mut words,
-                &counts,
-                best_pair,
-                new_token_id,
-                combined_len,
-                &mut pair_counts,
-                &mut heap,
-                &allowed_lengths,
-                &mut pair_positions,
-            );
+            let total_merges = match algorithm {
+                TrainerAlgorithm::Fast => apply_merge(
+                    &mut words,
+                    &counts,
+                    best_pair,
+                    new_token_id,
+                    combined_len,
+                    &mut pair_counts,
+                    &mut heap,
+                    &allowed_lengths,
+                    &mut pair_positions,
+                ),
+                TrainerAlgorithm::LowMemory => apply_merge_scan(
+                    &mut words,
+                    &counts,
+                    best_pair,
+                    new_token_id,
+                    combined_len,
+                    &mut pair_counts,
+                    &mut heap,
+                    &allowed_lengths,
+                ),
+            };
 
             if total_merges == 0 {
                 metrics.stop_reason = StopReason::NoEligiblePairs;
@@ -400,13 +428,15 @@ impl Trainer {
             };
             metrics.iterations.push(iteration_metrics);
 
-            prune_pair_cache(
-                &mut pair_counts,
-                &mut pair_positions,
-                &mut heap,
-                pair_cache_cap,
-                self.cfg.min_frequency,
-            );
+            if matches!(algorithm, TrainerAlgorithm::Fast) {
+                prune_pair_cache(
+                    &mut pair_counts,
+                    &mut pair_positions,
+                    &mut heap,
+                    pair_cache_cap,
+                    self.cfg.min_frequency,
+                );
+            }
         }
 
         if metrics.iterations.len() == max_new_tokens {
@@ -507,7 +537,7 @@ fn apply_merge(
     pair_counts: &mut FxHashMap<Pair, usize>,
     heap: &mut BinaryHeap<PairScore>,
     allowed_lengths: &[usize],
-    pair_positions: &mut FxHashMap<Pair, FxHashSet<usize>>,
+    pair_positions: &mut FxHashMap<Pair, Vec<u32>>,
 ) -> usize {
     let positions = pair_positions.remove(&pair).unwrap_or_default();
     if positions.is_empty() {
@@ -516,8 +546,18 @@ fn apply_merge(
 
     let mut aggregate_deltas: FxHashMap<Pair, i64> = FxHashMap::default();
     let mut total_merges = 0usize;
+    // Positions may contain duplicates because we replaced the
+    // FxHashSet<usize> structure with Vec<u32> for memory efficiency.
+    // Dedup per merge call only — cheaper than maintaining a global set
+    // across iterations because most merges touch a small position set.
+    let mut visited: FxHashSet<u32> =
+        FxHashSet::with_capacity_and_hasher(positions.len(), Default::default());
 
-    for idx in positions {
+    for raw_idx in positions {
+        if !visited.insert(raw_idx) {
+            continue;
+        }
+        let idx = raw_idx as usize;
         if idx >= words.len() {
             continue;
         }
@@ -538,7 +578,12 @@ fn apply_merge(
             }
             *aggregate_deltas.entry(pair_key).or_insert(0) += weighted;
             if delta > 0 {
-                pair_positions.entry(pair_key).or_default().insert(idx);
+                let entry = pair_positions.entry(pair_key).or_default();
+                // Cheap "consecutive duplicate" dedup; full dedup is
+                // amortized at lookup time.
+                if entry.last().copied() != Some(raw_idx) {
+                    entry.push(raw_idx);
+                }
             }
         }
     }
@@ -550,14 +595,121 @@ fn apply_merge(
     total_merges
 }
 
+/// Low-memory variant of `compute_pair_stats`: builds `pair -> count`
+/// only, no `pair -> word indices` index. Parallelised across rayon
+/// chunks; merged at the end. Peak memory is `O(unique_pairs * threads)`,
+/// much smaller than the inverted-index path which scales with the
+/// total number of pair-position pairs across the whole corpus.
+fn compute_pair_counts_scan(
+    words: &[Word],
+    counts: &[u64],
+    allowed_lengths: &[usize],
+) -> FxHashMap<Pair, usize> {
+    let chunk_size = (words.len() / (rayon::current_num_threads() * 4)).max(1024);
+    words
+        .par_iter()
+        .enumerate()
+        .with_min_len(chunk_size)
+        .fold(FxHashMap::<Pair, usize>::default, |mut acc, (idx, word)| {
+            if word.has_pairs() {
+                let weight: usize = counts[idx]
+                    .try_into()
+                    .expect("sequence count must fit in usize");
+                word.for_each_pair(allowed_lengths, |pair| {
+                    *acc.entry(pair).or_insert(0) += weight;
+                });
+            }
+            acc
+        })
+        .reduce(FxHashMap::<Pair, usize>::default, |mut left, right| {
+            for (pair, count) in right {
+                *left.entry(pair).or_insert(0) += count;
+            }
+            left
+        })
+}
+
+/// Scan-based merge: scans the entire word set in parallel, applies the
+/// merge to every word that contains the pair, accumulates per-thread
+/// delta maps, and reduces into the global pair-count table. Memory:
+/// `O(unique_pairs)` plus a small per-thread delta map. Per-merge wall:
+/// `O(words / threads * symbols_per_word)`. Suited to corpora where
+/// the inverted-index trainer's pair-position table would not fit.
+#[allow(clippy::too_many_arguments)]
+fn apply_merge_scan(
+    words: &mut [Word],
+    counts: &[u64],
+    pair: Pair,
+    new_token: TokenId,
+    new_token_len: usize,
+    pair_counts: &mut FxHashMap<Pair, usize>,
+    heap: &mut BinaryHeap<PairScore>,
+    allowed_lengths: &[usize],
+) -> usize {
+    let chunk_size = (words.len() / (rayon::current_num_threads() * 4)).max(1024);
+
+    type Local = (usize, FxHashMap<Pair, i64>);
+    let identity = || -> Local { (0, FxHashMap::default()) };
+
+    let (total_merges, deltas) = words
+        .par_iter_mut()
+        .enumerate()
+        .with_min_len(chunk_size)
+        .fold(identity, |mut acc, (idx, word)| {
+            if !word.has_pairs() {
+                return acc;
+            }
+            let result = word.merge(pair.0, pair.1, new_token, new_token_len, allowed_lengths);
+            if result.merges == 0 {
+                return acc;
+            }
+            let weight_usize: usize = counts[idx]
+                .try_into()
+                .expect("sequence count must fit in usize");
+            let weight_i64 = counts[idx] as i64;
+            acc.0 += result.merges * weight_usize;
+            for (pair_key, delta) in result.deltas {
+                let weighted = (delta as i64) * weight_i64;
+                if weighted == 0 {
+                    continue;
+                }
+                *acc.1.entry(pair_key).or_insert(0) += weighted;
+            }
+            acc
+        })
+        .reduce(identity, |mut left, right| {
+            left.0 += right.0;
+            for (pair_key, delta) in right.1 {
+                *left.1.entry(pair_key).or_insert(0) += delta;
+            }
+            left
+        });
+
+    // Apply the aggregated deltas into the global pair_counts and heap,
+    // then remove the merged pair entirely (its merges are consumed).
+    pair_counts.remove(&pair);
+    for (pair_key, delta) in deltas {
+        apply_delta(pair_counts, heap, pair_key, delta);
+    }
+
+    total_merges
+}
+
 fn compute_pair_stats(
     words: &[Word],
     counts: &[u64],
     allowed_lengths: &[usize],
-) -> (FxHashMap<Pair, usize>, FxHashMap<Pair, FxHashSet<usize>>) {
+) -> (FxHashMap<Pair, usize>, FxHashMap<Pair, Vec<u32>>) {
+    // Sequential single-pass pair counting. An earlier patch made this
+    // a rayon fold+reduce, but on a multi-GiB corpus that allocates one
+    // full pair table per worker thread, multiplying peak memory by the
+    // worker count. On the 24-core training box this OOM'd. The right
+    // shape would be sharded counters with bounded-thread accumulators;
+    // for now we keep this sequential and rely on the more compact
+    // Vec<u32> position structure (vs the original FxHashSet<usize>) to
+    // reduce per-pair overhead.
     let mut pair_counts: FxHashMap<Pair, usize> = FxHashMap::default();
-    let mut pair_positions: FxHashMap<Pair, FxHashSet<usize>> = FxHashMap::default();
-
+    let mut pair_positions: FxHashMap<Pair, Vec<u32>> = FxHashMap::default();
     for (idx, word) in words.iter().enumerate() {
         if !word.has_pairs() {
             continue;
@@ -565,12 +717,15 @@ fn compute_pair_stats(
         let weight: usize = counts[idx]
             .try_into()
             .expect("sequence count must fit in usize");
+        let raw_idx = u32::try_from(idx).expect("word index fits in u32");
         word.for_each_pair(allowed_lengths, |pair| {
             *pair_counts.entry(pair).or_insert(0) += weight;
-            pair_positions.entry(pair).or_default().insert(idx);
+            let entry = pair_positions.entry(pair).or_default();
+            if entry.last().copied() != Some(raw_idx) {
+                entry.push(raw_idx);
+            }
         });
     }
-
     (pair_counts, pair_positions)
 }
 
@@ -623,7 +778,7 @@ impl fmt::Display for TrainerArtifacts {
 
 fn prune_pair_cache(
     pair_counts: &mut FxHashMap<Pair, usize>,
-    pair_positions: &mut FxHashMap<Pair, FxHashSet<usize>>,
+    pair_positions: &mut FxHashMap<Pair, Vec<u32>>,
     heap: &mut BinaryHeap<PairScore>,
     max_pairs: usize,
     min_frequency: usize,
@@ -845,5 +1000,55 @@ mod tests {
                 token
             );
         }
+    }
+
+    #[test]
+    fn fast_and_low_memory_produce_identical_merges() {
+        // Both algorithms iterate by argmax pair frequency with the same
+        // tiebreak rules; they must produce byte-identical merge sequences
+        // for the same input. This test guards against silent divergence
+        // (e.g. floating-point or heap ordering drift between paths).
+        let sequences = vec![
+            vec![0x10, 0x20, 0x10, 0x20, 0x10, 0x20, 0x30],
+            vec![0x10, 0x20, 0x30, 0x40, 0x10, 0x20],
+            vec![0x10, 0x20, 0x10, 0x20],
+            vec![0x40, 0x50, 0x40, 0x50, 0x40, 0x50],
+            vec![0x60, 0x70, 0x60, 0x70, 0x60, 0x70, 0x60, 0x70],
+        ];
+
+        let cfg_fast = TrainerConfig::builder()
+            .min_frequency(2)
+            .target_vocab_size(290)
+            .reasoning_tokens_enabled(false)
+            .show_progress(false)
+            .algorithm(TrainerAlgorithm::Fast)
+            .build()
+            .unwrap();
+        let cfg_low = TrainerConfig::builder()
+            .min_frequency(2)
+            .target_vocab_size(290)
+            .reasoning_tokens_enabled(false)
+            .show_progress(false)
+            .algorithm(TrainerAlgorithm::LowMemory)
+            .build()
+            .unwrap();
+
+        let fast = Trainer::new(cfg_fast)
+            .train_from_sequences(sequences.clone())
+            .unwrap();
+        let low = Trainer::new(cfg_low)
+            .train_from_sequences(sequences)
+            .unwrap();
+
+        assert_eq!(
+            fast.model.merges(),
+            low.model.merges(),
+            "scan trainer must produce the same merges as fast"
+        );
+        assert_eq!(
+            fast.model.token_bytes(),
+            low.model.token_bytes(),
+            "scan trainer must produce the same vocabulary as fast"
+        );
     }
 }

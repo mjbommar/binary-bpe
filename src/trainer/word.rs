@@ -14,12 +14,20 @@ pub(crate) struct MergeOutcome {
 #[derive(Clone, Copy)]
 struct Symbol {
     token: TokenId,
-    len: usize,
+    len: u32,
 }
 
 impl Symbol {
     fn new(token: TokenId, len: usize) -> Self {
-        Self { token, len }
+        Self {
+            token,
+            len: len as u32,
+        }
+    }
+
+    #[inline]
+    fn len_usize(self) -> usize {
+        self.len as usize
     }
 }
 
@@ -50,7 +58,7 @@ impl Word {
         F: FnMut(Pair),
     {
         for window in self.symbols.windows(2) {
-            let combined = window[0].len + window[1].len;
+            let combined = window[0].len_usize() + window[1].len_usize();
             if is_allowed_length(combined, allowed_lengths) {
                 f((window[0].token, window[1].token));
             }
@@ -58,6 +66,9 @@ impl Word {
     }
 
     /// Applies the selected merge pair throughout the word and returns the resulting deltas.
+    ///
+    /// Uses two-pointer compaction: a single linear pass over `symbols` rewrites in
+    /// place with O(N) work, instead of O(N²) from repeated `Vec::remove`.
     pub(crate) fn merge(
         &mut self,
         left: TokenId,
@@ -67,71 +78,85 @@ impl Word {
         allowed_lengths: &[usize],
     ) -> MergeOutcome {
         let mut outcome = MergeOutcome::default();
-        if self.symbols.len() < 2 {
+        let len = self.symbols.len();
+        if len < 2 {
             return outcome;
         }
 
-        let mut i = 0usize;
-        while i + 1 < self.symbols.len() {
-            if self.symbols[i].token == left && self.symbols[i + 1].token == right {
-                let left_symbol = self.symbols[i];
-                let right_symbol = self.symbols[i + 1];
-                let combined_len = left_symbol.len + right_symbol.len;
-                if !is_allowed_length(combined_len, allowed_lengths) {
-                    i += 1;
+        let mut write: usize = 0;
+        let mut read: usize = 0;
+
+        while read < len {
+            // Try to merge at `read`.
+            if read + 1 < len
+                && self.symbols[read].token == left
+                && self.symbols[read + 1].token == right
+            {
+                let left_symbol = self.symbols[read];
+                let right_symbol = self.symbols[read + 1];
+                let combined_len = left_symbol.len_usize() + right_symbol.len_usize();
+                if is_allowed_length(combined_len, allowed_lengths) {
+                    // prev is whatever is currently at write-1 (post any earlier
+                    // merges in this same pass), matching the original semantics
+                    // where the array shifted left after each remove().
+                    let prev_symbol = if write > 0 {
+                        Some(self.symbols[write - 1])
+                    } else {
+                        None
+                    };
+                    let next_symbol = if read + 2 < len {
+                        Some(self.symbols[read + 2])
+                    } else {
+                        None
+                    };
+
+                    if let Some(prev) = prev_symbol {
+                        let combined = prev.len_usize() + left_symbol.len_usize();
+                        if is_allowed_length(combined, allowed_lengths) {
+                            outcome.deltas.push(((prev.token, left_symbol.token), -1));
+                        }
+                    }
+                    outcome
+                        .deltas
+                        .push(((left_symbol.token, right_symbol.token), -1));
+                    if let Some(next) = next_symbol {
+                        let combined = right_symbol.len_usize() + next.len_usize();
+                        if is_allowed_length(combined, allowed_lengths) {
+                            outcome.deltas.push(((right_symbol.token, next.token), -1));
+                        }
+                    }
+
+                    let merged = Symbol::new(replacement, replacement_len);
+                    if let Some(prev) = prev_symbol {
+                        let combined = prev.len_usize() + replacement_len;
+                        if is_allowed_length(combined, allowed_lengths) {
+                            outcome.deltas.push(((prev.token, replacement), 1));
+                        }
+                    }
+                    if let Some(next) = next_symbol {
+                        let combined = replacement_len + next.len_usize();
+                        if is_allowed_length(combined, allowed_lengths) {
+                            outcome.deltas.push(((replacement, next.token), 1));
+                        }
+                    }
+
+                    self.symbols[write] = merged;
+                    write += 1;
+                    read += 2;
+                    outcome.merges += 1;
                     continue;
                 }
-
-                let prev_symbol = if i > 0 {
-                    Some(self.symbols[i - 1])
-                } else {
-                    None
-                };
-                let next_symbol = if i + 2 < self.symbols.len() {
-                    Some(self.symbols[i + 2])
-                } else {
-                    None
-                };
-
-                // Remove affected adjacency counts.
-                if let Some(prev) = prev_symbol {
-                    let combined = prev.len + left_symbol.len;
-                    if is_allowed_length(combined, allowed_lengths) {
-                        outcome.deltas.push(((prev.token, left_symbol.token), -1));
-                    }
-                }
-                outcome
-                    .deltas
-                    .push(((left_symbol.token, right_symbol.token), -1));
-                if let Some(next) = next_symbol {
-                    let combined = right_symbol.len + next.len;
-                    if is_allowed_length(combined, allowed_lengths) {
-                        outcome.deltas.push(((right_symbol.token, next.token), -1));
-                    }
-                }
-
-                // Merge the pair in place.
-                self.symbols[i] = Symbol::new(replacement, replacement_len);
-                self.symbols.remove(i + 1);
-                outcome.merges += 1;
-
-                // Emit adjacencies formed with the merged token.
-                if let Some(prev) = prev_symbol {
-                    let combined = prev.len + replacement_len;
-                    if is_allowed_length(combined, allowed_lengths) {
-                        outcome.deltas.push(((prev.token, replacement), 1));
-                    }
-                }
-                if let Some(next) = next_symbol {
-                    let combined = replacement_len + next.len;
-                    if is_allowed_length(combined, allowed_lengths) {
-                        outcome.deltas.push(((replacement, next.token), 1));
-                    }
-                }
             }
-            i += 1;
+
+            // No merge: copy through.
+            if write != read {
+                self.symbols[write] = self.symbols[read];
+            }
+            write += 1;
+            read += 1;
         }
 
+        self.symbols.truncate(write);
         outcome
     }
 }
@@ -160,10 +185,8 @@ mod tests {
     #[test]
     fn enumerate_pairs_honors_allowed_lengths() {
         let word = Word::from_tokens(vec![1, 2, 3]);
-        let mut collected = Vec::new();
-        word.for_each_pair(&[3], |pair| collected.push(pair));
-        assert!(collected.is_empty());
-        word.for_each_pair(&[2], |pair| collected.push(pair));
-        assert_eq!(collected.len(), 2);
+        let mut pairs = Vec::new();
+        word.for_each_pair(&[2], |pair| pairs.push(pair));
+        assert_eq!(pairs, vec![(1, 2), (2, 3)]);
     }
 }

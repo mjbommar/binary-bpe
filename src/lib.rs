@@ -55,7 +55,8 @@ pub mod special_tokens;
 pub mod trainer;
 
 pub use config::{
-    IngestConfig, PreprocessorConfig, PreprocessorKind, TrainerBuilder, TrainerConfig,
+    IngestConfig, PreprocessorConfig, PreprocessorKind, TrainerAlgorithm, TrainerBuilder,
+    TrainerConfig,
 };
 pub use error::{BbpeError, Result};
 pub use metrics::{IterationMetrics, TrainingMetrics};
